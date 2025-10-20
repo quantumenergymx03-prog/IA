@@ -57,6 +57,7 @@ PATH_PAT_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/mod
 PATH_PAT_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/feature_keys.json"
 
 ISO_THRESHOLDS = (2.8, 4.5, 7.1)  # A, B, C mm/s (ajusta si aplica)
+ANALYSIS_WINDOW_SECONDS = 3.0
 GRAVITY_M_S2 = 9.80665
 
 _SEVERITY_MODEL: Optional[Any] = None
@@ -227,6 +228,39 @@ def _topk_probabilities(model: Any, X: np.ndarray, k: int = 3) -> Tuple[List[flo
     return probabilities, classes, top_classes
 
 
+def _resolve_rms_velocity(row: Mapping[str, Any]) -> float:
+    """Extrae el RMS de velocidad en mm/s desde la fila de características."""
+
+    candidates = [
+        "rms_vel_mm_s",
+        "RMS_vel_mm_s",
+        "RMS_global_mm_s",
+        "rms_global_mm_s",
+        "rms_mm_s",
+        "RMS_mm_s",
+        "vel_rms_mm_s",
+        "VEL_RMS_mm_s",
+        "rms_vel_time_mm",
+    ]
+
+    for key in candidates:
+        if key not in row:
+            continue
+        try:
+            value = float(row.get(key))
+        except Exception:
+            continue
+        if np.isfinite(value):
+            return float(value)
+
+    try:
+        g_val = float(row.get("RMS_g", 0.0))
+    except Exception:
+        g_val = 0.0
+
+    return float(g_val if np.isfinite(g_val) else 0.0)
+
+
 def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
     """Ejecuta el pipeline híbrido ISO+ML para severidad y patrones de falla."""
 
@@ -253,9 +287,9 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "message": f"Error preparando las features: {exc}"}
 
     try:
-        rms_val = float(row.get("RMS_g", row.get("rms_vel_mm_s", 0.0)) or 0.0)
+        rms_val = _resolve_rms_velocity(row)
         if rms_val < 0:
-            raise ValueError("RMS_g negativo detectado.")
+            raise ValueError("RMS negativo detectado.")
     except Exception as exc:
         return {"status": "error", "message": f"Dato RMS inválido: {exc}"}
 
@@ -1461,7 +1495,24 @@ def analyze_vibration(
     t, a = _clean_pair(t, a)
     if len(t) < 2:
         raise ValueError("Datos insuficientes.")
-    t, a = _segment(t, a, segment)
+
+    segment_to_use = segment
+    if segment_to_use is None and len(t) >= 2:
+        span = float(t[-1] - t[0])
+        if span > ANALYSIS_WINDOW_SECONDS:
+            start = float(max(t[-1] - ANALYSIS_WINDOW_SECONDS, t[0]))
+            segment_to_use = (start, float(t[-1]))
+
+    t, a = _segment(t, a, segment_to_use)
+    if len(t) >= 2:
+        segment_bounds = (float(t[0]), float(t[-1]))
+    elif len(t) == 1:
+        val = float(t[0])
+        segment_bounds = (val, val)
+    else:
+        segment_bounds = (0.0, 0.0)
+    if len(t) >= 1:
+        t = t - float(t[0])
     predec_info = None
     if pre_decimate_to_fmax_hz is not None:
         try:
@@ -1637,6 +1688,10 @@ def analyze_vibration(
     ml_status = ml_result.get("status")
     if ml_status == "ok":
         severity_info = ml_result.get("severity") or {}
+        applied_window = float(segment_bounds[1] - segment_bounds[0]) if len(t) >= 2 else float(0.0)
+        severity_info.setdefault("analysis_window_s", applied_window)
+        severity_info.setdefault("analysis_window_limit_s", ANALYSIS_WINDOW_SECONDS)
+        severity_info.setdefault("segment_bounds", (float(segment_bounds[0]), float(segment_bounds[1])))
         final_class = severity_info.get("class_final") or ml_result.get("label")
         ml_class = severity_info.get("class_ml")
         iso_class = severity_info.get("class_iso")
@@ -1802,7 +1857,8 @@ def analyze_vibration(
         findings.append("Sin anomalías evidentes según reglas actuales.")
     severity_summary, core_findings = _split_diagnosis(findings)
     return {
-        "segment_used": (float(t[0]), float(t[-1])),
+        "segment_used": (float(segment_bounds[0]), float(segment_bounds[1])),
+        "analysis_window_s": float(segment_bounds[1] - segment_bounds[0]) if len(t) >= 2 else float(0.0),
         "fs_hz": fs,
         "dt_s": dt,
         "df_hz": df,
