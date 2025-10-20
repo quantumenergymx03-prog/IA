@@ -269,9 +269,22 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
     sev_probabilities = _normalize_probabilities(probs_ml)
     sev_classes = list(getattr(sev_model, "classes_", []))
 
+    iso_prior = _iso_prior_distribution(sev_classes, y_iso)
+    iso_strength = _iso_confidence_from_rms(rms_val, ISO_THRESHOLDS, iso_class=y_iso)
+    if (
+        iso_prior
+        and len(iso_prior) == len(sev_probabilities)
+        and 0.0 < iso_strength < 1.0
+    ):
+        blended = (1.0 - iso_strength) * np.asarray(sev_probabilities) + iso_strength * np.asarray(iso_prior)
+        sev_probabilities = _normalize_probabilities(blended)
+    else:
+        iso_strength = 0.0
+
     missing_features = sorted(set(missing_sev + missing_pat))
 
     severity_pairs = list(zip(sev_classes, sev_probabilities))
+    iso_prior_pairs = list(zip(sev_classes, iso_prior)) if iso_prior else []
     severity_payload = {
         "rms_global_mm_s": rms_val,
         "iso_thresholds": {"A": ISO_THRESHOLDS[0], "B": ISO_THRESHOLDS[1], "C": ISO_THRESHOLDS[2]},
@@ -285,6 +298,11 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
             {"class": str(cls), "probability": float(prob)} for cls, prob in severity_pairs
         ],
         "missing_features": missing_features,
+        "iso_prior": iso_prior,
+        "iso_blend_strength": iso_strength,
+        "iso_prior_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in iso_prior_pairs
+        ] if iso_prior_pairs else [],
     }
 
     pattern_probabilities, pattern_classes, top3 = _topk_probabilities(pat_model, X_pat, k=3)
@@ -372,6 +390,78 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
     arr = arr / np.sum(arr)
     arr = np.clip(arr, 0.0, 1.0)
     return arr.tolist()
+
+
+def _iso_confidence_from_rms(
+    rms_mm_s: float,
+    thresholds: Tuple[float, float, float],
+    iso_class: Optional[str] = None,
+) -> float:
+    """Devuelve el peso con el que debe mezclarse la evidencia ISO en [0, 1)."""
+
+    try:
+        rms_val = float(rms_mm_s)
+    except Exception:
+        rms_val = 0.0
+
+    a, b, c = thresholds
+    iso_idx = ISO_ORDER.get(str(iso_class), None)
+    if iso_idx is None:
+        if rms_val <= a:
+            iso_idx = 0
+        elif rms_val <= b:
+            iso_idx = 1
+        elif rms_val <= c:
+            iso_idx = 2
+        else:
+            iso_idx = 3
+
+    if iso_idx <= 0:
+        ratio = rms_val / max(a, 1e-6)
+        strength = 0.35 + 0.25 * float(np.clip(1.0 - ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.25, 0.6))
+    if iso_idx == 1:
+        span = max(b - a, 1e-6)
+        ratio = (rms_val - a) / span
+        strength = 0.45 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.45, 0.65))
+    if iso_idx == 2:
+        span = max(c - b, 1e-6)
+        ratio = (rms_val - b) / span
+        strength = 0.6 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.6, 0.8))
+
+    ratio = (rms_val - c) / max(c, 1e-6)
+    strength = 0.75 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+    return float(np.clip(strength, 0.75, 0.95))
+
+
+def _iso_prior_distribution(class_names: Sequence[Any], iso_class: Optional[str]) -> List[float]:
+    """Construye una distribución prior basada en la clase ISO obtenida."""
+
+    if not class_names:
+        return []
+
+    iso_idx = ISO_ORDER.get(str(iso_class), None)
+    if iso_idx is None:
+        iso_idx = ISO_ORDER.get("Buena", 0)
+
+    sigma = 0.8
+    weights: List[float] = []
+    for cls in class_names:
+        order = ISO_ORDER.get(str(cls), iso_idx)
+        distance = abs(order - iso_idx)
+        base = float(np.exp(-((distance**2) / (2.0 * sigma**2))))
+        if order < iso_idx:
+            base *= 0.5
+        weights.append(base)
+
+    weights_array = np.asarray(weights, dtype=float)
+    if not np.any(weights_array):
+        return _normalize_probabilities([1.0 for _ in class_names])
+
+    normalized = weights_array / float(np.sum(weights_array))
+    return normalized.tolist()
 
 
 def _charlotte_to_mapping(row: Any) -> Mapping[str, Any]:
