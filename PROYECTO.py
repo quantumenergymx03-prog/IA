@@ -199,7 +199,7 @@ def _run_ml_diagnosis(feature_row: Dict[str, float]) -> Dict[str, Any]:
                     warnings.simplefilter("ignore", UserWarning)
                     proba = model.predict_proba(features_for_model)
                 if proba is not None:
-                    probabilities = proba[0].tolist()
+                    probabilities = _normalize_probabilities(proba[0])
                     classes = list(getattr(model, "classes_", []))
                 else:
                     classes = []
@@ -220,6 +220,41 @@ def _run_ml_diagnosis(feature_row: Dict[str, float]) -> Dict[str, Any]:
             "status": "error",
             "message": f"Error al ejecutar el modelo: {exc}",
         }
+
+
+def _normalize_probabilities(raw_values: Any) -> List[float]:
+    """Convierte salidas arbitrarias de probabilidad en valores entre 0 y 1."""
+
+    try:
+        values = [float(v) for v in list(raw_values)]
+    except Exception:
+        return []
+
+    if not values:
+        return []
+
+    min_val = min(values)
+    max_val = max(values)
+    sum_val = sum(values)
+
+    def _clip_range(nums: List[float]) -> List[float]:
+        return [max(0.0, min(1.0, v)) for v in nums]
+
+    # Caso típico: probabilidades ya entre 0 y 1.
+    if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
+        return _clip_range(values)
+
+    # Algunos modelos almacenan porcentajes en lugar de proporciones.
+    if max_val <= 100.0 + 1e-6 and min_val >= -1e-6:
+        scaled = [v / 100.0 for v in values]
+        return _clip_range(scaled)
+
+    # Fallback: normalizar por la suma cuando sea positiva.
+    if sum_val > 0:
+        scaled = [max(0.0, v) / sum_val for v in values]
+        return _clip_range(scaled)
+
+    return _clip_range(values)
 
 # Conjunto de fallas consideradas en la Tabla de Charlotte para motores eléctricos.
 # Cada entrada incluye un identificador, el nombre de la falla y una descripción breve
