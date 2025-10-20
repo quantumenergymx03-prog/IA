@@ -270,6 +270,7 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
 
     missing_features = sorted(set(missing_sev + missing_pat))
 
+    severity_pairs = list(zip(sev_classes, sev_probabilities))
     severity_payload = {
         "rms_global_mm_s": rms_val,
         "iso_thresholds": {"A": ISO_THRESHOLDS[0], "B": ISO_THRESHOLDS[1], "C": ISO_THRESHOLDS[2]},
@@ -279,6 +280,9 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         "conflict_flag": bool(conflict),
         "probabilities": sev_probabilities,
         "classes": sev_classes,
+        "probabilities_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in severity_pairs
+        ],
         "missing_features": missing_features,
     }
 
@@ -288,11 +292,15 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         rationale = ""
 
+    pattern_pairs = list(zip(pattern_classes, pattern_probabilities))
     patterns_payload = {
         "classes": pattern_classes,
         "probabilities": pattern_probabilities,
         "top3": top3,
         "rationale_rule": rationale,
+        "probabilities_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in pattern_pairs
+        ],
         "missing_features": missing_features,
     }
 
@@ -312,35 +320,53 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
     """Convierte salidas arbitrarias de probabilidad en valores entre 0 y 1."""
 
     try:
-        values = [float(v) for v in list(raw_values)]
+        arr = np.asarray(list(raw_values), dtype=float)
     except Exception:
         return []
 
-    if not values:
+    if arr.size == 0:
         return []
 
-    min_val = min(values)
-    max_val = max(values)
-    sum_val = sum(values)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _clip_range(nums: List[float]) -> List[float]:
-        return [max(0.0, min(1.0, v)) for v in nums]
+    # Si tenemos valores negativos asumimos que son logits y aplicamos softmax.
+    if np.any(arr < 0.0):
+        shifted = arr - np.max(arr)
+        exp_scores = np.exp(shifted)
+        total = float(np.sum(exp_scores))
+        if total <= 0:
+            arr = np.full_like(arr, 1.0 / arr.size)
+        else:
+            arr = exp_scores / total
+    else:
+        max_val = float(np.max(arr))
+        min_val = float(np.min(arr))
 
-    # Caso típico: probabilidades ya entre 0 y 1.
-    if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
-        return _clip_range(values)
+        if max_val <= 0.0:
+            return [0.0 for _ in arr.tolist()]
 
-    # Algunos modelos almacenan porcentajes en lugar de proporciones.
-    if max_val <= 100.0 + 1e-6 and min_val >= -1e-6:
-        scaled = [v / 100.0 for v in values]
-        return _clip_range(scaled)
+        if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
+            scaled = arr.copy()
+        elif max_val <= 100.0 + 1e-6 and min_val >= -1e-6:
+            scaled = arr / 100.0
+        else:
+            scaled = arr / max_val
 
-    # Fallback: normalizar por la suma cuando sea positiva.
-    if sum_val > 0:
-        scaled = [max(0.0, v) / sum_val for v in values]
-        return _clip_range(scaled)
+        scaled = np.clip(scaled, 0.0, None)
+        total = float(np.sum(scaled))
+        if total > 0:
+            arr = scaled / total
+        else:
+            arr = np.full_like(scaled, 1.0 / scaled.size)
 
-    return _clip_range(values)
+    if arr.size > 1:
+        # Suavizado de Laplace para evitar distribuciones degeneradas.
+        smooth = max(1e-3, 1.0 / (50.0 * arr.size))
+        arr = arr + smooth
+        arr = arr / np.sum(arr)
+
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr.tolist()
 
 
 def _charlotte_to_mapping(row: Any) -> Mapping[str, Any]:
