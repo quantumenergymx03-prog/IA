@@ -11,6 +11,7 @@ import matplotlib
 import re
 import joblib
 import warnings
+import json
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -21,7 +22,8 @@ mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
 import unicodedata
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Sequence, Mapping
+
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -47,179 +49,528 @@ import shutil
 
 APP_VERSION = "v1.0.0"
 
-# Ruta por defecto al modelo de machine learning entrenado para diagnóstico.
-MODEL_PATH = "C:\\Users\\QTMP0104\\Downloads\\Proyecto\\Proyecto\\Proyecto\\IA\\model_aligned\\model.pkl"
+# === rutas (ajústalas a tu estructura) ===
+PATH_MAPPED_CSV = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/features_dataset_10s_mapped.csv"
+PATH_SEV_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/model.pkl"
+PATH_SEV_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/feature_keys.json"
+PATH_PAT_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/pattern_model.pkl"
+PATH_PAT_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/feature_keys.json"
 
-# Columnas esperadas por el modelo al momento de generar predicciones.
-ML_FEATURE_COLUMNS = [
-    "RMS_g", "crest", "kurt_excess",
-    "E_low", "E_mid", "E_hi",
-    "PCT_low", "PCT_mid", "PCT_hi",
-    "F1X_hz", "A1X", "F2X_hz", "A2X", "F3X_hz", "A3X",
-    "R_2X_1X", "R_3X_1X", "SNR_1X_dB"
+ISO_THRESHOLDS = (2.8, 4.5, 7.1)  # A, B, C mm/s (ajusta si aplica)
+ANALYSIS_WINDOW_SECONDS = 3.0
+GRAVITY_M_S2 = 9.80665
 
-]
+_SEVERITY_MODEL: Optional[Any] = None
+_PATTERN_MODEL: Optional[Any] = None
+_SEVERITY_KEYS: Optional[List[str]] = None
+_PATTERN_KEYS: Optional[List[str]] = None
+_ML_ASSETS_ERROR: Optional[str] = None
 
-_ML_MODEL = None
-_ML_MODEL_ERROR = None
+ISO_ORDER = {"Buena": 0, "Satisfactoria": 1, "Insatisfactoria": 2, "Inaceptable": 3}
 
-from typing import Tuple, Optional, Sequence, Dict, Any
-import numpy as np
-import joblib
 
-# --- Definición de la clase HybridISOModel ---
-ISO_ORDER = {"Buena":0, "Satisfactoria":1, "Insatisfactoria":2, "Inaceptable":3}
-
-def iso20816_class_from_rms(rms_mm_s: float, thresholds=(2.8,4.5,7.1)) -> str:
-    a,b,c = thresholds
-    if rms_mm_s <= a: return "Buena"
-    if rms_mm_s <= b: return "Satisfactoria"
-    if rms_mm_s <= c: return "Insatisfactoria"
+def iso20816_class_from_rms(rms_mm_s: float, thresholds: Tuple[float, float, float] = ISO_THRESHOLDS) -> str:
+    a, b, c = thresholds
+    if rms_mm_s <= a:
+        return "Buena"
+    if rms_mm_s <= b:
+        return "Satisfactoria"
+    if rms_mm_s <= c:
+        return "Insatisfactoria"
     return "Inaceptable"
 
+
 class HybridISOModel:
-    def __init__(self, base_model, thresholds=(2.8,4.5,7.1), class_names=None):
+    def __init__(
+        self,
+        base_model: Any,
+        thresholds: Tuple[float, float, float] = ISO_THRESHOLDS,
+        class_names: Optional[Sequence[str]] = None,
+    ):
         self.model = base_model
         self.thresholds = thresholds
-        self.classes_ = list(class_names) if class_names else getattr(base_model, "classes_", ["Buena","Satisfactoria","Insatisfactoria","Inaceptable"])
-    def predict(self, X, rms_global_mm_s: float):
+        default_classes = ["Buena", "Satisfactoria", "Insatisfactoria", "Inaceptable"]
+
+        resolved_classes: Any = class_names
+        if resolved_classes is None:
+            resolved_classes = getattr(base_model, "classes_", default_classes)
+
+        if isinstance(resolved_classes, np.ndarray):
+            resolved_classes = resolved_classes.tolist()
+
+        try:
+            resolved_classes = list(resolved_classes)
+        except TypeError:
+            resolved_classes = list(default_classes)
+
+        if not resolved_classes:
+            resolved_classes = list(default_classes)
+
+        self.classes_ = [str(cls_name) for cls_name in resolved_classes]
+
+    def predict(self, X: Any, rms_global_mm_s: float) -> Tuple[str, np.ndarray, str, str, bool]:
         X = np.asarray(X).reshape(1, -1)
         probs = self.model.predict_proba(X)[0]
         y_ml = self.classes_[int(np.argmax(probs))]
-        y_iso = iso20816_class_from_rms(rms_global_mm_s, self.thresholds)
-        y_final = y_iso if ISO_ORDER[y_ml] < ISO_ORDER[y_iso] else y_ml
-        conflict = abs(ISO_ORDER[y_ml] - ISO_ORDER[y_iso]) >= 2
+        y_iso = iso20816_class_from_rms(float(rms_global_mm_s), self.thresholds)
+        y_final = y_iso if ISO_ORDER.get(y_ml, 0) < ISO_ORDER.get(y_iso, 0) else y_ml
+        conflict = abs(ISO_ORDER.get(y_ml, 0) - ISO_ORDER.get(y_iso, 0)) >= 2
         return y_ml, probs, y_iso, y_final, conflict
 
-# --- Carga del modelo y uso ---
-model = joblib.load("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/model.pkl")
 
-# ✅ Aquí sí va esta línea
-hybrid = HybridISOModel(model, thresholds=(2.8,4.5,7.1))
+def _load_ml_assets() -> Optional[Tuple[Any, Any, List[str], List[str]]]:
+    """Carga y cachea los modelos de severidad y patrones junto a sus llaves."""
 
-# --- Ejemplo de uso ---
-import pandas as pd, json
-df = pd.read_csv("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/features_dataset_10s_mapped.csv")
-feature_keys = json.load(open("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/feature_keys.json"))
+    global _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS, _ML_ASSETS_ERROR
 
-X = df[feature_keys].astype(float).values[0]
-rms_global = float(df["RMS_g"].iloc[0])
+    if _ML_ASSETS_ERROR:
+        return None
 
-y_ml, p_ml, y_iso, y_final, conflict = hybrid.predict(X, rms_global)
-print(f"ML={y_ml}, ISO={y_iso}, Final={y_final}, Conflicto={conflict}")
+    if (
+        _SEVERITY_MODEL is not None
+        and _PATTERN_MODEL is not None
+        and _SEVERITY_KEYS is not None
+        and _PATTERN_KEYS is not None
+    ):
+        return _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS
 
-
-def _load_ml_model():
-    """Carga el modelo de machine learning entrenado desde disco (una única vez)."""
-
-    global _ML_MODEL, _ML_MODEL_ERROR
-    if _ML_MODEL is not None or _ML_MODEL_ERROR is not None:
-        return _ML_MODEL
     try:
-        _ML_MODEL = joblib.load(MODEL_PATH)
-        _ensure_model_feature_names(_ML_MODEL)
+        if _SEVERITY_MODEL is None:
+            _SEVERITY_MODEL = joblib.load(PATH_SEV_MODEL)
+        if _SEVERITY_KEYS is None:
+            with open(PATH_SEV_KEYS, "r", encoding="utf-8") as fh:
+                raw_keys = json.load(fh)
+            _SEVERITY_KEYS = [str(k) for k in raw_keys]
     except FileNotFoundError as exc:
-        _ML_MODEL_ERROR = f"Modelo no encontrado en {MODEL_PATH}: {exc}"
+        _ML_ASSETS_ERROR = f"Modelo de severidad no encontrado: {exc}"
+        return None
     except Exception as exc:  # pragma: no cover - defensivo
-        _ML_MODEL_ERROR = f"No se pudo cargar el modelo de ML: {exc}"
-    return _ML_MODEL
-
-
-def _ensure_model_feature_names(model: Any) -> None:
-    """Asigna nombres de features esperados cuando el modelo carece de ellos."""
+        _ML_ASSETS_ERROR = f"No se pudo cargar el modelo de severidad: {exc}"
+        return None
 
     try:
-        if hasattr(model, "feature_names_in_"):
-            names = getattr(model, "feature_names_in_")
-            if names is None or len(names) == 0:
-                setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
-            return
-        if hasattr(model, "estimators_") and isinstance(getattr(model, "estimators_"), list):
-            setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
-            return
-        if hasattr(model, "steps") and isinstance(getattr(model, "steps"), list):
-            for _, step in getattr(model, "steps"):
-                _ensure_model_feature_names(step)
-            if not hasattr(model, "feature_names_in_"):
-                setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
+        if _PATTERN_MODEL is None:
+            _PATTERN_MODEL = joblib.load(PATH_PAT_MODEL)
+        if _PATTERN_KEYS is None:
+            with open(PATH_PAT_KEYS, "r", encoding="utf-8") as fh:
+                raw_keys = json.load(fh)
+            _PATTERN_KEYS = [str(k) for k in raw_keys]
+    except FileNotFoundError as exc:
+        _ML_ASSETS_ERROR = f"Modelo de patrones no encontrado: {exc}"
+        return None
+    except Exception as exc:  # pragma: no cover - defensivo
+        _ML_ASSETS_ERROR = f"No se pudo cargar el modelo de patrones: {exc}"
+        return None
+
+    if (
+        _SEVERITY_MODEL is None
+        or _PATTERN_MODEL is None
+        or _SEVERITY_KEYS is None
+        or _PATTERN_KEYS is None
+    ):
+        _ML_ASSETS_ERROR = "Modelos de ML incompletos para el diagnóstico"
+        return None
+
+    return _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS
+
+
+def _series_from_features(feature_row: Dict[str, Any]) -> pd.Series:
+    """Convierte un diccionario o serie en una serie de Pandas con índices en str."""
+
+    if isinstance(feature_row, pd.Series):
+        return feature_row
+    try:
+        return pd.Series({str(k): v for k, v in dict(feature_row).items()})
     except Exception:
-        # Si no es posible asignar los nombres, dejamos el modelo tal como está.
-        pass
+        raise ValueError("Las características proporcionadas no son válidas para el modelo.")
 
 
-def _run_ml_diagnosis(feature_row: Dict[str, float]) -> Dict[str, Any]:
-    """Ejecuta el modelo de ML sobre un conjunto de features y devuelve el resultado."""
+def _build_feature_matrix(row: pd.Series, keys: List[str]) -> Tuple[np.ndarray, List[str]]:
+    """Ordena y convierte las características siguiendo la lista de llaves entregada."""
 
-    model = _load_ml_model()
-    if model is None:
+    if not isinstance(row, pd.Series):
+        row = pd.Series(row)
+
+    selected = row.reindex(keys)
+    missing = [key for key, value in selected.items() if pd.isna(value)]
+    if missing:
+        selected.loc[missing] = 0.0
+
+    try:
+        values = selected.astype(float).values.reshape(1, -1)
+    except Exception as exc:
+        raise ValueError(f"No se pudieron convertir las columnas a float: {exc}")
+
+    return values, missing
+
+
+def _topk_probabilities(model: Any, X: np.ndarray, k: int = 3) -> Tuple[List[float], List[str], List[Dict[str, Any]]]:
+    """Obtiene probabilidades normalizadas y las k clases principales."""
+
+    if not hasattr(model, "predict_proba"):
+        return [], list(getattr(model, "classes_", [])), []
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        proba = model.predict_proba(X)
+
+    if proba is None or len(proba) == 0:
+        return [], list(getattr(model, "classes_", [])), []
+
+    probabilities = _normalize_probabilities(proba[0])
+    classes = list(getattr(model, "classes_", []))
+    order = np.argsort(probabilities)[::-1] if probabilities else []
+    top_classes: List[Dict[str, Any]] = []
+    for idx in list(order)[:k]:
+        cls_name = classes[idx] if idx < len(classes) else str(idx)
+        prob_val = probabilities[idx] if idx < len(probabilities) else 0.0
+        top_classes.append({"class": str(cls_name), "probability": float(prob_val)})
+    return probabilities, classes, top_classes
+
+
+def _resolve_rms_velocity(row: Mapping[str, Any]) -> float:
+    """Extrae el RMS de velocidad en mm/s desde la fila de características."""
+
+    candidates = [
+        "rms_vel_mm_s",
+        "RMS_vel_mm_s",
+        "RMS_global_mm_s",
+        "rms_global_mm_s",
+        "rms_mm_s",
+        "RMS_mm_s",
+        "vel_rms_mm_s",
+        "VEL_RMS_mm_s",
+        "rms_vel_time_mm",
+    ]
+
+    for key in candidates:
+        if key not in row:
+            continue
+        try:
+            value = float(row.get(key))
+        except Exception:
+            continue
+        if np.isfinite(value):
+            return float(value)
+
+    try:
+        g_val = float(row.get("RMS_g", 0.0))
+    except Exception:
+        g_val = 0.0
+
+    return float(g_val if np.isfinite(g_val) else 0.0)
+
+
+def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Ejecuta el pipeline híbrido ISO+ML para severidad y patrones de falla."""
+
+    assets = _load_ml_assets()
+    if assets is None:
         return {
             "status": "unavailable",
-            "message": _ML_MODEL_ERROR or "Modelo no disponible",
+            "message": _ML_ASSETS_ERROR or "Modelos de ML no disponibles",
         }
 
+    sev_model, pat_model, sev_keys, pat_keys = assets
+
     try:
-        df_features = pd.DataFrame([feature_row])
-        df_features = df_features.reindex(columns=ML_FEATURE_COLUMNS)
-        df_features = df_features.fillna(0.0)
-        try:
-            df_features = df_features.astype(float)
-        except Exception:
-            df_features = df_features.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
-        expected_names: List[str] = []
-        if hasattr(model, "feature_names_in_"):
-            try:
-                raw_names = getattr(model, "feature_names_in_")
-                if raw_names is not None:
-                    expected_names = [str(name) for name in list(raw_names) if name is not None]
-            except Exception:
-                expected_names = []
-
-        target_columns = expected_names if expected_names else ML_FEATURE_COLUMNS
-        df_features = df_features.reindex(columns=target_columns).fillna(0.0)
-        features_for_model: Any = df_features
+        row = _series_from_features(feature_row)
     except Exception as exc:
-        return {
-            "status": "error",
-            "message": f"No se pudieron preparar las features para el modelo: {exc}",
-        }
+        return {"status": "error", "message": str(exc)}
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            raw_pred = model.predict(features_for_model)[0]
-        try:
-            pred_value = raw_pred.item()  # type: ignore[attr-defined]
-        except Exception:
-            pred_value = raw_pred
-        probabilities = None
-        if hasattr(model, "predict_proba"):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    proba = model.predict_proba(features_for_model)
-                if proba is not None:
-                    probabilities = proba[0].tolist()
-                    classes = list(getattr(model, "classes_", []))
-                else:
-                    classes = []
-            except Exception:
-                probabilities = None
-                classes = []
+        X_sev, missing_sev = _build_feature_matrix(row, sev_keys)
+        X_pat, missing_pat = _build_feature_matrix(row, pat_keys)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+    except Exception as exc:  # pragma: no cover - defensivo
+        return {"status": "error", "message": f"Error preparando las features: {exc}"}
+
+    try:
+        rms_val = _resolve_rms_velocity(row)
+        if rms_val < 0:
+            raise ValueError("RMS negativo detectado.")
+    except Exception as exc:
+        return {"status": "error", "message": f"Dato RMS inválido: {exc}"}
+
+    hybrid = HybridISOModel(sev_model, thresholds=ISO_THRESHOLDS, class_names=getattr(sev_model, "classes_", None))
+
+    try:
+        y_ml, probs_ml, y_iso, y_final, conflict = hybrid.predict(X_sev, rms_val)
+    except Exception as exc:
+        return {"status": "error", "message": f"No fue posible combinar ISO y ML: {exc}"}
+
+    sev_probabilities = _normalize_probabilities(probs_ml)
+    sev_classes = list(getattr(sev_model, "classes_", []))
+
+    iso_prior = _iso_prior_distribution(sev_classes, y_iso)
+    iso_strength = _iso_confidence_from_rms(rms_val, ISO_THRESHOLDS, iso_class=y_iso)
+    if (
+        iso_prior
+        and len(iso_prior) == len(sev_probabilities)
+        and 0.0 < iso_strength < 1.0
+    ):
+        blended = (1.0 - iso_strength) * np.asarray(sev_probabilities) + iso_strength * np.asarray(iso_prior)
+        sev_probabilities = _normalize_probabilities(blended)
+    else:
+        iso_strength = 0.0
+
+    missing_features = sorted(set(missing_sev + missing_pat))
+
+    severity_pairs = list(zip(sev_classes, sev_probabilities))
+    iso_prior_pairs = list(zip(sev_classes, iso_prior)) if iso_prior else []
+    severity_payload = {
+        "rms_global_mm_s": rms_val,
+        "iso_thresholds": {"A": ISO_THRESHOLDS[0], "B": ISO_THRESHOLDS[1], "C": ISO_THRESHOLDS[2]},
+        "class_iso": y_iso,
+        "class_ml": y_ml,
+        "class_final": y_final,
+        "conflict_flag": bool(conflict),
+        "probabilities": sev_probabilities,
+        "classes": sev_classes,
+        "probabilities_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in severity_pairs
+        ],
+        "missing_features": missing_features,
+        "iso_prior": iso_prior,
+        "iso_blend_strength": iso_strength,
+        "iso_prior_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in iso_prior_pairs
+        ] if iso_prior_pairs else [],
+    }
+
+    pattern_probabilities, pattern_classes, top3 = _topk_probabilities(pat_model, X_pat, k=3)
+    try:
+        rationale = weak_label_row(row)
+    except Exception:
+        rationale = ""
+
+    pattern_pairs = list(zip(pattern_classes, pattern_probabilities))
+    patterns_payload = {
+        "classes": pattern_classes,
+        "probabilities": pattern_probabilities,
+        "top3": top3,
+        "rationale_rule": rationale,
+        "probabilities_by_class": [
+            {"class": str(cls), "probability": float(prob)} for cls, prob in pattern_pairs
+        ],
+        "missing_features": missing_features,
+    }
+
+    return {
+        "status": "ok",
+        "label": str(y_final),
+        "raw_prediction": y_ml,
+        "probabilities": sev_probabilities,
+        "classes": sev_classes,
+        "severity": severity_payload,
+        "patterns": patterns_payload,
+        "missing_features": missing_features,
+    }
+
+
+def _normalize_probabilities(raw_values: Any) -> List[float]:
+    """Convierte salidas arbitrarias de probabilidad en valores entre 0 y 1."""
+
+    try:
+        arr = np.asarray(list(raw_values), dtype=float)
+    except Exception:
+        return []
+
+    if arr.size == 0:
+        return []
+
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if not np.any(arr):
+        return [0.0 for _ in range(arr.size)]
+
+    if np.any(arr < 0.0):
+        shifted = arr - np.max(arr)
+        exp_scores = np.exp(shifted)
+        total = float(np.sum(exp_scores))
+        if total <= 0:
+            arr = np.full_like(arr, 1.0 / arr.size)
         else:
-            classes = []
-        return {
-            "status": "ok",
-            "label": str(pred_value),
-            "raw_prediction": pred_value,
-            "probabilities": probabilities,
-            "classes": classes,
-        }
-    except Exception as exc:  # pragma: no cover - robustez
-        return {
-            "status": "error",
-            "message": f"Error al ejecutar el modelo: {exc}",
-        }
+            arr = exp_scores / total
+    else:
+        max_val = float(np.max(arr))
+        min_val = float(np.min(arr))
+
+        if max_val <= 0.0:
+            return [0.0 for _ in range(arr.size)]
+
+        if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
+            scaled = arr.copy()
+        elif max_val <= 100.0 + 1e-6 and min_val >= -1e-6:
+            scaled = arr / 100.0
+        else:
+            total = float(np.sum(arr))
+            if total <= 0:
+                scaled = np.full_like(arr, 1.0 / arr.size)
+            else:
+                scaled = arr / total
+
+        scaled = np.clip(scaled, 0.0, None)
+        total = float(np.sum(scaled))
+        if total <= 0:
+            arr = np.full_like(scaled, 1.0 / scaled.size)
+        else:
+            arr = scaled / total
+
+    epsilon = max(1e-3, 1.0 / (250.0 * max(1, arr.size)))
+    arr = np.clip(arr, 0.0, None)
+    arr = arr + epsilon
+    arr = arr / np.sum(arr)
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr.tolist()
+
+
+def _iso_confidence_from_rms(
+    rms_mm_s: float,
+    thresholds: Tuple[float, float, float],
+    iso_class: Optional[str] = None,
+) -> float:
+    """Devuelve el peso con el que debe mezclarse la evidencia ISO en [0, 1)."""
+
+    try:
+        rms_val = float(rms_mm_s)
+    except Exception:
+        rms_val = 0.0
+
+    a, b, c = thresholds
+    iso_idx = ISO_ORDER.get(str(iso_class), None)
+    if iso_idx is None:
+        if rms_val <= a:
+            iso_idx = 0
+        elif rms_val <= b:
+            iso_idx = 1
+        elif rms_val <= c:
+            iso_idx = 2
+        else:
+            iso_idx = 3
+
+    if iso_idx <= 0:
+        ratio = rms_val / max(a, 1e-6)
+        strength = 0.35 + 0.25 * float(np.clip(1.0 - ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.25, 0.6))
+    if iso_idx == 1:
+        span = max(b - a, 1e-6)
+        ratio = (rms_val - a) / span
+        strength = 0.45 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.45, 0.65))
+    if iso_idx == 2:
+        span = max(c - b, 1e-6)
+        ratio = (rms_val - b) / span
+        strength = 0.6 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+        return float(np.clip(strength, 0.6, 0.8))
+
+    ratio = (rms_val - c) / max(c, 1e-6)
+    strength = 0.75 + 0.2 * float(np.clip(ratio, 0.0, 1.0))
+    return float(np.clip(strength, 0.75, 0.95))
+
+
+def _iso_prior_distribution(class_names: Sequence[Any], iso_class: Optional[str]) -> List[float]:
+    """Construye una distribución prior basada en la clase ISO obtenida."""
+
+    if not class_names:
+        return []
+
+    iso_idx = ISO_ORDER.get(str(iso_class), None)
+    if iso_idx is None:
+        iso_idx = ISO_ORDER.get("Buena", 0)
+
+    sigma = 0.8
+    weights: List[float] = []
+    for cls in class_names:
+        order = ISO_ORDER.get(str(cls), iso_idx)
+        distance = abs(order - iso_idx)
+        base = float(np.exp(-((distance**2) / (2.0 * sigma**2))))
+        if order < iso_idx:
+            base *= 0.5
+        weights.append(base)
+
+    weights_array = np.asarray(weights, dtype=float)
+    if not np.any(weights_array):
+        return _normalize_probabilities([1.0 for _ in class_names])
+
+    normalized = weights_array / float(np.sum(weights_array))
+    return normalized.tolist()
+
+
+def _charlotte_to_mapping(row: Any) -> Mapping[str, Any]:
+    """Convierte la fila recibida a un mapeo para las reglas de Charlotte."""
+
+    if isinstance(row, Mapping):
+        return row
+    if hasattr(row, "to_dict"):
+        try:
+            return row.to_dict()
+        except Exception:  # pragma: no cover - defensivo
+            pass
+    if hasattr(row, "items"):
+        return dict(row)
+    raise ValueError("No se pudo interpretar la fila de características para reglas Charlotte")
+
+
+def _charlotte_safe_float(data: Mapping[str, Any], key: str, fallback_keys: Tuple[str, ...] = ()) -> float:
+    """Obtiene un valor numérico de forma robusta para reglas Charlotte."""
+
+    keys = (key,) + tuple(fallback_keys)
+    for candidate in keys:
+        try:
+            value = data.get(candidate)  # type: ignore[arg-type]
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def weak_label_row(row: Any) -> str:
+    """Devuelve una explicación textual basada en reglas simples estilo Charlotte."""
+
+    data = _charlotte_to_mapping(row)
+
+    pct_low = _charlotte_safe_float(data, "PCT_low", ("energy_low",))
+    pct_mid = _charlotte_safe_float(data, "PCT_mid", ("energy_mid",))
+    pct_high = _charlotte_safe_float(data, "PCT_hi", ("energy_high",))
+    r2x = _charlotte_safe_float(data, "R_2X_1X", ("r2x",))
+    r3x = _charlotte_safe_float(data, "R_3X_1X", ("r3x",))
+    crest = _charlotte_safe_float(data, "crest")
+    kurtosis = _charlotte_safe_float(data, "kurt_excess")
+    snr_1x = _charlotte_safe_float(data, "SNR_1X_dB", ("snr_1x_db",))
+    rms = _charlotte_safe_float(data, "RMS_g", ("rms_vel_mm_s",))
+
+    rationale_parts: List[str] = []
+
+    if pct_low > 0.55 and r2x < 0.5 and r3x < 0.4:
+        rationale_parts.append(
+            "Energía concentrada en baja frecuencia con armónicos contenidos: indicio de desbalance"
+        )
+    if r2x >= 0.6 or r3x >= 0.45:
+        rationale_parts.append(
+            "Armónicos 2X/3X elevados respecto a 1X, compatibles con desalineación"
+        )
+    if pct_high >= 0.35 or crest >= 5.0 or kurtosis >= 4.0:
+        rationale_parts.append(
+            "Alta energía en alta frecuencia y factores estadísticos grandes: posible defecto en rodamientos"
+        )
+    if snr_1x >= 12.0 and pct_mid >= 0.25:
+        rationale_parts.append(
+            "Dominancia pronunciada de 1X con energía media: verificar solturas o resonancias"
+        )
+    if not rationale_parts and rms >= 7.0:
+        rationale_parts.append("Nivel RMS elevado: condición severa según norma ISO")
+
+    if not rationale_parts:
+        return "Sin reglas Charlotte activas para esta muestra."
+
+    return " | ".join(rationale_parts)
 
 # Conjunto de fallas consideradas en la Tabla de Charlotte para motores eléctricos.
 # Cada entrada incluye un identificador, el nombre de la falla y una descripción breve
@@ -1144,7 +1495,24 @@ def analyze_vibration(
     t, a = _clean_pair(t, a)
     if len(t) < 2:
         raise ValueError("Datos insuficientes.")
-    t, a = _segment(t, a, segment)
+
+    segment_to_use = segment
+    if segment_to_use is None and len(t) >= 2:
+        span = float(t[-1] - t[0])
+        if span > ANALYSIS_WINDOW_SECONDS:
+            start = float(max(t[-1] - ANALYSIS_WINDOW_SECONDS, t[0]))
+            segment_to_use = (start, float(t[-1]))
+
+    t, a = _segment(t, a, segment_to_use)
+    if len(t) >= 2:
+        segment_bounds = (float(t[0]), float(t[-1]))
+    elif len(t) == 1:
+        val = float(t[0])
+        segment_bounds = (val, val)
+    else:
+        segment_bounds = (0.0, 0.0)
+    if len(t) >= 1:
+        t = t - float(t[0])
     predec_info = None
     if pre_decimate_to_fmax_hz is not None:
         try:
@@ -1202,9 +1570,23 @@ def analyze_vibration(
         dom_freq, dom_amp = 0.0, 0.0
     # Severidad basada en RMS de velocidad temporal (mm/s)
     rms_vel_spec_mm = rms_vel_time_mm
+    crest_factor = float(peak_acc / rms_time_acc) if rms_time_acc > 1e-9 else 0.0
+    kurt_excess = 0.0
+    if len(a_proc) >= 4:
+        centered = a_proc - float(np.mean(a_proc))
+        m2 = float(np.mean(centered**2))
+        m4 = float(np.mean(centered**4))
+        if m2 > 1e-12:
+            kurt_excess = float(m4 / (m2**2) - 3.0)
+
     f1 = _get_1x(dom_freq, rpm)
-    r2x = _amp_near(xf, mag_vel_mm, 2.0 * f1 if f1 > 0 else 0.0, df) / (dom_amp + 1e-12)
-    r3x = _amp_near(xf, mag_vel_mm, 3.0 * f1 if f1 > 0 else 0.0, df) / (dom_amp + 1e-12)
+    amp_1x = _amp_near(xf, mag_vel_mm, f1, df) if f1 > 0 else (dom_amp if dom_freq > 0 else 0.0)
+    f2 = 2.0 * f1 if f1 > 0 else 0.0
+    f3 = 3.0 * f1 if f1 > 0 else 0.0
+    amp_2x = _amp_near(xf, mag_vel_mm, f2, df) if f2 > 0 else 0.0
+    amp_3x = _amp_near(xf, mag_vel_mm, f3, df) if f3 > 0 else 0.0
+    r2x = amp_2x / (amp_1x + 1e-12)
+    r3x = amp_3x / (amp_1x + 1e-12)
     if len(xf) > 0:
         e_total = float(np.sum(mag_vel_mm**2)) + 1e-12
         e_low = float(np.sum((mag_vel_mm[(xf >= 0.0) & (xf < 30.0)]**2))) if np.any((xf >= 0) & (xf < 30)) else 0.0
@@ -1216,6 +1598,18 @@ def analyze_vibration(
     energy_mid_frac = float(e_mid / e_total) if e_total > 0 else 0.0
     energy_high_frac = float(e_high / e_total) if e_total > 0 else 0.0
     peaks_fft = _find_top_peaks(xf, mag_vel_mm, k=top_k_peaks, min_freq=0.5, snr_db=min_snr_db)
+
+    if amp_1x > 0.0 and len(xf) and len(mag_vel_mm):
+        base_freq = f1 if f1 > 0 else dom_freq
+        guard = max(tol_frac * max(base_freq, 1.0), max(2, min_bins) * (df if df > 0 else 0.0))
+        mask = (xf >= max(0.5, base_freq * 0.2)) & (np.abs(xf - base_freq) > guard)
+        noise_floor = float(np.median(mag_vel_mm[mask])) if np.any(mask) else 0.0
+        if noise_floor > 0.0:
+            snr_1x_db = float(20.0 * np.log10(np.maximum(amp_1x, 1e-12) / (noise_floor + 1e-12)))
+        else:
+            snr_1x_db = 0.0
+    else:
+        snr_1x_db = 0.0
     # Envolvente: opcionalmente aplicar band-pass previo
     a_env_src = a_proc
     try:
@@ -1240,25 +1634,92 @@ def analyze_vibration(
     sev_label, sev_color = _severity_iso_mm_s(rms_vel_spec_mm)
     findings: List[str] = []
     findings.append(f"Severidad ISO: {sev_label} (RMS={rms_vel_spec_mm:.3f} mm/s)")
+    pct_low = energy_low_frac * 100.0
+    pct_mid = energy_mid_frac * 100.0
+    pct_high = energy_high_frac * 100.0
+    rms_acc_g = rms_time_acc / GRAVITY_M_S2 if GRAVITY_M_S2 else 0.0
+
     ml_features = {
+        # Aceleración
         "rms_acc_ms2": rms_time_acc,
+        "rms_acc_g": rms_acc_g,
+        "RMS_g": rms_acc_g,
         "peak_acc_ms2": peak_acc,
         "pp_acc_ms2": pp_acc,
+        "crest": crest_factor,
+        "crest_factor": crest_factor,
+        "kurt_excess": kurt_excess,
+        "kurtosis": kurt_excess + 3.0,
+        # Velocidad y severidad
         "rms_vel_mm_s": rms_vel_spec_mm,
+        "RMS_vel_mm_s": rms_vel_spec_mm,
+        "RMS_global_mm_s": rms_vel_spec_mm,
+        "rms_global_mm_s": rms_vel_spec_mm,
+        # Dominantes espectrales
         "dom_freq_hz": dom_freq,
         "dom_amp_mm_s": dom_amp,
+        "F1X_hz": f1,
+        "A1X": amp_1x,
+        "F2X_hz": f2,
+        "A2X": amp_2x,
+        "F3X_hz": f3,
+        "A3X": amp_3x,
+        # Relaciones armónicas y métricas de energía
         "r2x": r2x,
         "r3x": r3x,
+        "R_2X_1X": r2x,
+        "R_3X_1X": r3x,
+        "snr_1x_db": snr_1x_db,
+        "SNR_1X_dB": snr_1x_db,
         "energy_low": energy_low_frac,
         "energy_mid": energy_mid_frac,
         "energy_high": energy_high_frac,
+        "E_low": energy_low_frac,
+        "E_mid": energy_mid_frac,
+        "E_hi": energy_high_frac,
+        "PCT_low": pct_low,
+        "PCT_mid": pct_mid,
+        "PCT_hi": pct_high,
+        "pct_low": pct_low,
+        "pct_mid": pct_mid,
+        "pct_hi": pct_high,
     }
     ml_result = _run_ml_diagnosis(ml_features)
-    if ml_result.get("status") == "ok" and ml_result.get("label"):
-        findings.append(f"Diagnóstico ML: {ml_result['label']}")
-    elif ml_result.get("status") == "error" and ml_result.get("message"):
+    ml_status = ml_result.get("status")
+    if ml_status == "ok":
+        severity_info = ml_result.get("severity") or {}
+        applied_window = float(segment_bounds[1] - segment_bounds[0]) if len(t) >= 2 else float(0.0)
+        severity_info.setdefault("analysis_window_s", applied_window)
+        severity_info.setdefault("analysis_window_limit_s", ANALYSIS_WINDOW_SECONDS)
+        severity_info.setdefault("segment_bounds", (float(segment_bounds[0]), float(segment_bounds[1])))
+        final_class = severity_info.get("class_final") or ml_result.get("label")
+        ml_class = severity_info.get("class_ml")
+        iso_class = severity_info.get("class_iso")
+        conflict_flag = severity_info.get("conflict_flag")
+        if final_class:
+            detail = f"Diagnóstico ML (híbrido ISO): {final_class}"
+            if ml_class and iso_class:
+                detail += f" (ML={ml_class}, ISO={iso_class})"
+            findings.append(detail)
+        if conflict_flag:
+            findings.append("Se detectó conflicto elevado entre la norma ISO y el modelo ML (≥2 niveles).")
+        patterns_info = ml_result.get("patterns") or {}
+        top3 = patterns_info.get("top3") or []
+        if top3:
+            best_pat = top3[0]
+            try:
+                prob_pct = float(best_pat.get("probability", 0.0)) * 100.0
+            except Exception:
+                prob_pct = 0.0
+            findings.append(
+                f"Patrón predominante según ML: {best_pat.get('class', 'Desconocido')} ({prob_pct:.1f}%)."
+            )
+        rationale = patterns_info.get("rationale_rule")
+        if rationale:
+            findings.append(f"Explicación tipo Charlotte: {rationale}")
+    elif ml_status == "error" and ml_result.get("message"):
         findings.append(f"Diagnóstico ML no disponible: {ml_result['message']}")
-    elif ml_result.get("status") == "unavailable" and ml_result.get("message"):
+    elif ml_status == "unavailable" and ml_result.get("message"):
         findings.append(f"Modelo ML no disponible: {ml_result['message']}")
     if f1 > 0 and dom_freq > 0:
         if (abs(dom_freq - f1) <= max(tol_frac * f1, min_bins * df)) and (r2x < 0.5) and (r3x < 0.4) and (e_low / e_total > 0.5):
@@ -1396,7 +1857,8 @@ def analyze_vibration(
         findings.append("Sin anomalías evidentes según reglas actuales.")
     severity_summary, core_findings = _split_diagnosis(findings)
     return {
-        "segment_used": (float(t[0]), float(t[-1])),
+        "segment_used": (float(segment_bounds[0]), float(segment_bounds[1])),
+        "analysis_window_s": float(segment_bounds[1] - segment_bounds[0]) if len(t) >= 2 else float(0.0),
         "fs_hz": fs,
         "dt_s": dt,
         "df_hz": df,
@@ -4144,19 +4606,34 @@ class MainApp:
                 ml_r2x = float(ml_features_bundle.get('r2x', features_full.get('r2x', 0.0)))
             except Exception:
                 ml_r2x = float(features_full.get('r2x', 0.0))
+
+            severity_pdf = ml_result_pdf.get('severity') if isinstance(ml_result_pdf, dict) else {}
+            severity_pdf = severity_pdf or {}
+            final_class_pdf = severity_pdf.get('class_final') or ml_result_pdf.get('label')
+            iso_class_pdf = severity_pdf.get('class_iso')
+            ml_class_pdf = severity_pdf.get('class_ml')
+            conflict_pdf = bool(severity_pdf.get('conflict_flag'))
+
             ml_status_value = str(
                 ml_result_pdf.get('status')
                 or (ml_bundle_pdf or {}).get('status')
                 or ''
             ).lower()
-            ml_label_display = str(ml_result_pdf.get('label', '') or "No disponible")
-            if ml_status_value != 'ok':
+            if ml_status_value == 'ok':
+                ml_label_display = str(final_class_pdf or "No disponible")
+                detail_parts: List[str] = []
+                if iso_class_pdf:
+                    detail_parts.append(f"ISO: {iso_class_pdf}")
+                if ml_class_pdf:
+                    detail_parts.append(f"ML: {ml_class_pdf}")
+                context_bits = f"Energía >120 Hz {frac_high_pct:.1f}% y relación 2X {ml_r2x:.2f}X."
+                ml_comment = " | ".join(detail_parts) if detail_parts else "Diagnóstico híbrido ISO+ML."
+                ml_comment = f"{ml_comment} {context_bits}".strip()
+                if conflict_pdf:
+                    ml_comment += " Conflicto elevado entre ambos criterios."
+            else:
                 ml_label_display = "No disponible"
-            ml_comment = (
-                f"Energía >120 Hz {frac_high_pct:.1f}% y relación 2X {ml_r2x:.2f}X sin patrones críticos."
-                if ml_status_value == 'ok'
-                else "Modelo ML no disponible para esta medición."
-            )
+                ml_comment = "Modelo ML no disponible para esta medición."
 
             comparison_rows = [
                 (
@@ -4172,13 +4649,14 @@ class MainApp:
             ]
             comparison_table = _build_diagnostic_comparison(comparison_rows)
             if ml_status_value == 'ok':
+                ml_base = ml_class_pdf or ml_label_display
                 discrepancy_note = (
-                    f"Nota sobre el diagnóstico: Mientras que los niveles de vibración RMS (<b>{primary_rms_mm_pdf:.3f} mm/s</b>) "
-                    f"superan los límites de la norma ISO y ubican la condición como <b>{severity_mm}</b>, el modelo de Machine "
-                    f"Learning se apoya en rasgos como la baja energía en alta frecuencia ({frac_high_pct:.1f}%) y una relación 2X "
-                    f"de {ml_r2x:.2f}, por lo que clasifica el activo como \"{ml_label_display}\". Se recomienda priorizar el "
-                    "criterio de la norma ISO debido al riesgo energético evidente."
+                    f"Nota sobre el diagnóstico: la norma ISO clasifica esta medición como <b>{severity_mm}</b> (RMS <b>{primary_rms_mm_pdf:.3f} mm/s</b>). "
+                    f"El modelo ML identifica la condición como <b>{ml_base}</b> apoyándose en la energía de alta frecuencia ({frac_high_pct:.1f}%) y en una relación 2X de {ml_r2x:.2f}. "
+                    f"El esquema híbrido ISO+ML adopta finalmente la condición <b>{ml_label_display}</b>."
                 )
+                if conflict_pdf:
+                    discrepancy_note += " <b>Existe conflicto elevado entre ISO y ML; valide la condición con inspección adicional.</b>"
             else:
                 discrepancy_note = (
                     "Nota sobre el diagnóstico: El modelo de Machine Learning no emitió una clasificación confiable para esta "
@@ -4219,8 +4697,26 @@ class MainApp:
                 except Exception:
                     accent_hex_value = "#1f77b4"
                 if ml_status_pdf == 'ok':
-                    ml_label = str(ml_result_pdf.get('label', ''))
-                    ml_card_body.append(Paragraph(f"Resultado sugerido: <b>{ml_label}</b>", styles['Normal']))
+                    severity_pdf = ml_result_pdf.get('severity') if isinstance(ml_result_pdf, dict) else {}
+                    severity_pdf = severity_pdf or {}
+                    patterns_pdf = ml_result_pdf.get('patterns') if isinstance(ml_result_pdf, dict) else {}
+                    patterns_pdf = patterns_pdf or {}
+
+                    ml_label = str(severity_pdf.get('class_final') or ml_result_pdf.get('label', '') or 'No disponible')
+                    iso_pdf = severity_pdf.get('class_iso')
+                    ml_inner = severity_pdf.get('class_ml')
+                    conflict_pdf = bool(severity_pdf.get('conflict_flag'))
+
+                    ml_card_body.append(Paragraph(f"Resultado híbrido: <b>{ml_label}</b>", styles['Normal']))
+                    detail_parts = []
+                    if iso_pdf:
+                        detail_parts.append(f"ISO: <b>{iso_pdf}</b>")
+                    if ml_inner:
+                        detail_parts.append(f"ML: <b>{ml_inner}</b>")
+                    if detail_parts:
+                        ml_card_body.append(Paragraph(" | ".join(detail_parts), styles['Muted']))
+                    if conflict_pdf:
+                        ml_card_body.append(Paragraph('<font color="#c0392b"><b>Conflicto elevado entre ISO y ML.</b></font>', styles['Normal']))
                     ml_card_body.append(Spacer(1, 4))
                     ml_card_body.append(Paragraph("Características evaluadas", styles['Muted']))
                     ml_features_pdf = dict(ml_features_bundle)
@@ -4231,8 +4727,8 @@ class MainApp:
                         ("Energía alta", f"{ml_features_pdf.get('energy_high', 0.0) * 100:.1f}%"),
                     ]
                     ml_card_body.append(_pdf_metric_grid(feature_metrics, accent_color))
-                    classes = list(ml_result_pdf.get('classes') or [])
-                    probabilities = list(ml_result_pdf.get('probabilities') or [])
+                    classes = list(severity_pdf.get('classes') or ml_result_pdf.get('classes') or [])
+                    probabilities = list(severity_pdf.get('probabilities') or ml_result_pdf.get('probabilities') or [])
                     if classes and probabilities and len(classes) == len(probabilities):
                         ranked = sorted(zip(classes, probabilities), key=lambda x: x[1], reverse=True)
                         proba_rows: List[List[Any]] = []
@@ -4258,6 +4754,36 @@ class MainApp:
                         ml_card_body.append(Spacer(1, 6))
                         ml_card_body.append(Paragraph("Probabilidades por clase", styles['Muted']))
                         ml_card_body.append(proba_tbl)
+                    pattern_top_pdf = patterns_pdf.get('top3') or []
+                    rationale_pdf = str(patterns_pdf.get('rationale_rule') or '').strip()
+                    if pattern_top_pdf:
+                        pat_rows: List[List[Any]] = []
+                        for entry in pattern_top_pdf:
+                            prob_val = float(entry.get('probability', 0.0))
+                            pat_rows.append([
+                                Paragraph(f"<b>{str(entry.get('class', 'Patrón'))}</b>", styles['Normal']),
+                                ProbabilityBar(prob_val, fill_color=accent_hex_value, back_color="#f5eef8"),
+                                Paragraph(f"{prob_val * 100:.1f}%", styles['Normal']),
+                            ])
+                        pat_tbl = Table(pat_rows, colWidths=[doc.width * 0.32, doc.width * 0.28, doc.width * 0.2])
+                        pat_tbl.setStyle(
+                            TableStyle(
+                                [
+                                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d7d7d7")),
+                                ]
+                            )
+                        )
+                        ml_card_body.append(Spacer(1, 6))
+                        ml_card_body.append(Paragraph("Patrones más probables", styles['Muted']))
+                        ml_card_body.append(pat_tbl)
+                    if rationale_pdf:
+                        ml_card_body.append(Spacer(1, 4))
+                        ml_card_body.append(Paragraph(f"Explicación Charlotte: {rationale_pdf}", styles['Normal']))
                 else:
                     ml_message = ml_result_pdf.get('message') or "No se pudo obtener el diagnóstico automático."
                 if ml_message:
@@ -5067,16 +5593,22 @@ class MainApp:
         )
 
         if status == "ok":
-            label = str(ml_result.get("label", "Diagnóstico"))
-            classes = list(ml_result.get("classes") or [])
-            probabilities = list(ml_result.get("probabilities") or [])
-            probs_view: List[ft.Control] = []
-            if classes and probabilities and len(classes) == len(probabilities):
-                ranked = sorted(zip(classes, probabilities), key=lambda x: x[1], reverse=True)
+            severity_info = ml_result.get("severity") or {}
+            patterns_info = ml_result.get("patterns") or {}
+
+            final_label = str(severity_info.get("class_final") or ml_result.get("label") or "Diagnóstico")
+            iso_label = severity_info.get("class_iso")
+            ml_label = severity_info.get("class_ml")
+            conflict_flag = bool(severity_info.get("conflict_flag"))
+
+            severity_classes = list(ml_result.get("classes") or [])
+            severity_probabilities = list(ml_result.get("probabilities") or [])
+            sev_view: List[ft.Control] = []
+            if severity_classes and severity_probabilities and len(severity_classes) == len(severity_probabilities):
+                ranked = sorted(zip(severity_classes, severity_probabilities), key=lambda x: x[1], reverse=True)
                 for cls, prob in ranked:
                     prob_val = float(prob)
-                    bar = ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent)
-                    probs_view.append(
+                    sev_view.append(
                         ft.Column(
                             [
                                 ft.Row(
@@ -5086,29 +5618,80 @@ class MainApp:
                                     ],
                                     alignment="spaceBetween",
                                 ),
-                                bar,
+                                ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent),
                             ],
                             spacing=4,
                         )
                     )
+
+            highlight_lines: List[ft.Control] = [
+                ft.Text(f"Severidad final: {final_label}", weight="bold", color=accent)
+            ]
+            sub_parts: List[str] = []
+            if iso_label:
+                sub_parts.append(f"ISO: {iso_label}")
+            if ml_label:
+                sub_parts.append(f"ML: {ml_label}")
+            if sub_parts:
+                highlight_lines.append(ft.Text(" | ".join(sub_parts), size=12, color="#34495e"))
+            if conflict_flag:
+                highlight_lines.append(
+                    ft.Text(
+                        "Conflicto elevado entre ISO y ML",
+                        size=12,
+                        color="#c0392b",
+                        weight="bold",
+                    )
+                )
             highlight = ft.Container(
-                content=ft.Text(
-                    f"Resultado sugerido: {label}",
-                    weight="bold",
-                    color=accent,
-                ),
+                content=ft.Column(highlight_lines, spacing=4),
                 bgcolor=ft.Colors.with_opacity(0.15, accent),
                 border_radius=12,
                 padding=ft.padding.symmetric(horizontal=14, vertical=10),
             )
-            body_controls: List[ft.Control] = [highlight, metrics_row]
-            if probs_view:
-                body_controls.append(
-                    ft.Column(
-                        probs_view,
-                        spacing=6,
+
+            pattern_top = patterns_info.get("top3") or []
+            pattern_view: List[ft.Control] = []
+            if pattern_top:
+                for entry in pattern_top:
+                    prob_val = float(entry.get("probability", 0.0))
+                    pattern_view.append(
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Text(str(entry.get("class", "Patrón")), weight="bold", expand=True),
+                                        ft.Text(f"{prob_val * 100:.1f}%", weight="bold"),
+                                    ],
+                                    alignment="spaceBetween",
+                                ),
+                                ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent),
+                            ],
+                            spacing=4,
+                        )
+                    )
+
+            rationale_text = str(patterns_info.get("rationale_rule") or "").strip()
+            pattern_section_controls: List[ft.Control] = []
+            if pattern_view:
+                pattern_section_controls.append(ft.Text("Patrones probables", weight="bold", size=13))
+                pattern_section_controls.append(ft.Column(pattern_view, spacing=6))
+            if rationale_text:
+                pattern_section_controls.append(
+                    ft.Text(
+                        f"Explicación Charlotte: {rationale_text}",
+                        size=12,
+                        color="#34495e",
                     )
                 )
+
+            body_controls: List[ft.Control] = [highlight, metrics_row]
+            if sev_view:
+                body_controls.append(ft.Text("Probabilidades de severidad", weight="bold", size=13))
+                body_controls.append(ft.Column(sev_view, spacing=6))
+            if pattern_section_controls:
+                body_controls.append(ft.Container(ft.Column(pattern_section_controls, spacing=6), padding=ft.padding.only(top=6)))
+
             return ft.Container(
                 content=ft.Column(
                     [
