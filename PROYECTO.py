@@ -365,6 +365,18 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
         arr = arr + smooth
         arr = arr / np.sum(arr)
 
+        # Mezcla adaptativa con la distribución uniforme cuando la entropía es baja.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            entropy = float(-np.sum(arr * np.log(np.clip(arr, 1e-12, 1.0))))
+        max_entropy = float(np.log(arr.size)) if arr.size else 0.0
+        if max_entropy > 0.0 and entropy < max_entropy:
+            concentration = entropy / max_entropy
+            if concentration < 0.6:
+                beta = float(np.clip((0.6 - concentration) * 0.75, 0.12, 0.38))
+                uniform = np.full_like(arr, 1.0 / arr.size)
+                arr = (1.0 - beta) * arr + beta * uniform
+                arr = arr / np.sum(arr)
+
     arr = np.clip(arr, 0.0, 1.0)
     return arr.tolist()
 
