@@ -11,6 +11,7 @@ import matplotlib
 import re
 import joblib
 import warnings
+import json
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -21,7 +22,9 @@ mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
 import unicodedata
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Sequence
+
+from charlotte_rules import weak_label_row
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -47,179 +50,230 @@ import shutil
 
 APP_VERSION = "v1.0.0"
 
-# Ruta por defecto al modelo de machine learning entrenado para diagnóstico.
-MODEL_PATH = "C:\\Users\\QTMP0104\\Downloads\\Proyecto\\Proyecto\\Proyecto\\IA\\model_aligned\\model.pkl"
+# === rutas (ajústalas a tu estructura) ===
+PATH_MAPPED_CSV = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/features_dataset_10s_mapped.csv"
+PATH_SEV_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/model.pkl"
+PATH_SEV_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/feature_keys.json"
+PATH_PAT_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/pattern_model.pkl"
+PATH_PAT_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/feature_keys.json"
 
-# Columnas esperadas por el modelo al momento de generar predicciones.
-ML_FEATURE_COLUMNS = [
-    "RMS_g", "crest", "kurt_excess",
-    "E_low", "E_mid", "E_hi",
-    "PCT_low", "PCT_mid", "PCT_hi",
-    "F1X_hz", "A1X", "F2X_hz", "A2X", "F3X_hz", "A3X",
-    "R_2X_1X", "R_3X_1X", "SNR_1X_dB"
+ISO_THRESHOLDS = (2.8, 4.5, 7.1)  # A, B, C mm/s (ajusta si aplica)
 
-]
+_SEVERITY_MODEL: Optional[Any] = None
+_PATTERN_MODEL: Optional[Any] = None
+_SEVERITY_KEYS: Optional[List[str]] = None
+_PATTERN_KEYS: Optional[List[str]] = None
+_ML_ASSETS_ERROR: Optional[str] = None
 
-_ML_MODEL = None
-_ML_MODEL_ERROR = None
+ISO_ORDER = {"Buena": 0, "Satisfactoria": 1, "Insatisfactoria": 2, "Inaceptable": 3}
 
-from typing import Tuple, Optional, Sequence, Dict, Any
-import numpy as np
-import joblib
 
-# --- Definición de la clase HybridISOModel ---
-ISO_ORDER = {"Buena":0, "Satisfactoria":1, "Insatisfactoria":2, "Inaceptable":3}
-
-def iso20816_class_from_rms(rms_mm_s: float, thresholds=(2.8,4.5,7.1)) -> str:
-    a,b,c = thresholds
-    if rms_mm_s <= a: return "Buena"
-    if rms_mm_s <= b: return "Satisfactoria"
-    if rms_mm_s <= c: return "Insatisfactoria"
+def iso20816_class_from_rms(rms_mm_s: float, thresholds: Tuple[float, float, float] = ISO_THRESHOLDS) -> str:
+    a, b, c = thresholds
+    if rms_mm_s <= a:
+        return "Buena"
+    if rms_mm_s <= b:
+        return "Satisfactoria"
+    if rms_mm_s <= c:
+        return "Insatisfactoria"
     return "Inaceptable"
 
+
 class HybridISOModel:
-    def __init__(self, base_model, thresholds=(2.8,4.5,7.1), class_names=None):
+    def __init__(self, base_model: Any, thresholds: Tuple[float, float, float] = ISO_THRESHOLDS, class_names: Optional[Sequence[str]] = None):
         self.model = base_model
         self.thresholds = thresholds
-        self.classes_ = list(class_names) if class_names else getattr(base_model, "classes_", ["Buena","Satisfactoria","Insatisfactoria","Inaceptable"])
-    def predict(self, X, rms_global_mm_s: float):
+        default_classes = ["Buena", "Satisfactoria", "Insatisfactoria", "Inaceptable"]
+        if class_names is None:
+            class_names = getattr(base_model, "classes_", default_classes)
+        self.classes_ = list(class_names) if class_names else list(default_classes)
+
+    def predict(self, X: Any, rms_global_mm_s: float) -> Tuple[str, np.ndarray, str, str, bool]:
         X = np.asarray(X).reshape(1, -1)
         probs = self.model.predict_proba(X)[0]
         y_ml = self.classes_[int(np.argmax(probs))]
-        y_iso = iso20816_class_from_rms(rms_global_mm_s, self.thresholds)
-        y_final = y_iso if ISO_ORDER[y_ml] < ISO_ORDER[y_iso] else y_ml
-        conflict = abs(ISO_ORDER[y_ml] - ISO_ORDER[y_iso]) >= 2
+        y_iso = iso20816_class_from_rms(float(rms_global_mm_s), self.thresholds)
+        y_final = y_iso if ISO_ORDER.get(y_ml, 0) < ISO_ORDER.get(y_iso, 0) else y_ml
+        conflict = abs(ISO_ORDER.get(y_ml, 0) - ISO_ORDER.get(y_iso, 0)) >= 2
         return y_ml, probs, y_iso, y_final, conflict
 
-# --- Carga del modelo y uso ---
-model = joblib.load("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/model.pkl")
 
-# ✅ Aquí sí va esta línea
-hybrid = HybridISOModel(model, thresholds=(2.8,4.5,7.1))
+def _load_ml_assets() -> Optional[Tuple[Any, Any, List[str], List[str]]]:
+    """Carga y cachea los modelos de severidad y patrones junto a sus llaves."""
 
-# --- Ejemplo de uso ---
-import pandas as pd, json
-df = pd.read_csv("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/features_dataset_10s_mapped.csv")
-feature_keys = json.load(open("C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_aligned/feature_keys.json"))
+    global _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS, _ML_ASSETS_ERROR
 
-X = df[feature_keys].astype(float).values[0]
-rms_global = float(df["RMS_g"].iloc[0])
+    if _ML_ASSETS_ERROR:
+        return None
 
-y_ml, p_ml, y_iso, y_final, conflict = hybrid.predict(X, rms_global)
-print(f"ML={y_ml}, ISO={y_iso}, Final={y_final}, Conflicto={conflict}")
+    if (
+        _SEVERITY_MODEL is not None
+        and _PATTERN_MODEL is not None
+        and _SEVERITY_KEYS is not None
+        and _PATTERN_KEYS is not None
+    ):
+        return _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS
 
-
-def _load_ml_model():
-    """Carga el modelo de machine learning entrenado desde disco (una única vez)."""
-
-    global _ML_MODEL, _ML_MODEL_ERROR
-    if _ML_MODEL is not None or _ML_MODEL_ERROR is not None:
-        return _ML_MODEL
     try:
-        _ML_MODEL = joblib.load(MODEL_PATH)
-        _ensure_model_feature_names(_ML_MODEL)
+        if _SEVERITY_MODEL is None:
+            _SEVERITY_MODEL = joblib.load(PATH_SEV_MODEL)
+        if _SEVERITY_KEYS is None:
+            with open(PATH_SEV_KEYS, "r", encoding="utf-8") as fh:
+                raw_keys = json.load(fh)
+            _SEVERITY_KEYS = [str(k) for k in raw_keys]
     except FileNotFoundError as exc:
-        _ML_MODEL_ERROR = f"Modelo no encontrado en {MODEL_PATH}: {exc}"
+        _ML_ASSETS_ERROR = f"Modelo de severidad no encontrado: {exc}"
+        return None
     except Exception as exc:  # pragma: no cover - defensivo
-        _ML_MODEL_ERROR = f"No se pudo cargar el modelo de ML: {exc}"
-    return _ML_MODEL
-
-
-def _ensure_model_feature_names(model: Any) -> None:
-    """Asigna nombres de features esperados cuando el modelo carece de ellos."""
+        _ML_ASSETS_ERROR = f"No se pudo cargar el modelo de severidad: {exc}"
+        return None
 
     try:
-        if hasattr(model, "feature_names_in_"):
-            names = getattr(model, "feature_names_in_")
-            if names is None or len(names) == 0:
-                setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
-            return
-        if hasattr(model, "estimators_") and isinstance(getattr(model, "estimators_"), list):
-            setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
-            return
-        if hasattr(model, "steps") and isinstance(getattr(model, "steps"), list):
-            for _, step in getattr(model, "steps"):
-                _ensure_model_feature_names(step)
-            if not hasattr(model, "feature_names_in_"):
-                setattr(model, "feature_names_in_", np.array(ML_FEATURE_COLUMNS, dtype=object))
+        if _PATTERN_MODEL is None:
+            _PATTERN_MODEL = joblib.load(PATH_PAT_MODEL)
+        if _PATTERN_KEYS is None:
+            with open(PATH_PAT_KEYS, "r", encoding="utf-8") as fh:
+                raw_keys = json.load(fh)
+            _PATTERN_KEYS = [str(k) for k in raw_keys]
+    except FileNotFoundError as exc:
+        _ML_ASSETS_ERROR = f"Modelo de patrones no encontrado: {exc}"
+        return None
+    except Exception as exc:  # pragma: no cover - defensivo
+        _ML_ASSETS_ERROR = f"No se pudo cargar el modelo de patrones: {exc}"
+        return None
+
+    if (
+        _SEVERITY_MODEL is None
+        or _PATTERN_MODEL is None
+        or _SEVERITY_KEYS is None
+        or _PATTERN_KEYS is None
+    ):
+        _ML_ASSETS_ERROR = "Modelos de ML incompletos para el diagnóstico"
+        return None
+
+    return _SEVERITY_MODEL, _PATTERN_MODEL, _SEVERITY_KEYS, _PATTERN_KEYS
+
+
+def _series_from_features(feature_row: Dict[str, Any]) -> pd.Series:
+    """Convierte un diccionario o serie en una serie de Pandas con índices en str."""
+
+    if isinstance(feature_row, pd.Series):
+        return feature_row
+    try:
+        return pd.Series({str(k): v for k, v in dict(feature_row).items()})
     except Exception:
-        # Si no es posible asignar los nombres, dejamos el modelo tal como está.
-        pass
+        raise ValueError("Las características proporcionadas no son válidas para el modelo.")
 
 
-def _run_ml_diagnosis(feature_row: Dict[str, float]) -> Dict[str, Any]:
-    """Ejecuta el modelo de ML sobre un conjunto de features y devuelve el resultado."""
+def _build_feature_matrix(row: pd.Series, keys: List[str]) -> np.ndarray:
+    """Ordena y convierte las características siguiendo la lista de llaves entregada."""
 
-    model = _load_ml_model()
-    if model is None:
+    missing = [k for k in keys if k not in row.index]
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas: {missing}")
+    values = row[keys].astype(float).values.reshape(1, -1)
+    return values
+
+
+def _topk_probabilities(model: Any, X: np.ndarray, k: int = 3) -> Tuple[List[float], List[str], List[Dict[str, Any]]]:
+    """Obtiene probabilidades normalizadas y las k clases principales."""
+
+    if not hasattr(model, "predict_proba"):
+        return [], list(getattr(model, "classes_", [])), []
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        proba = model.predict_proba(X)
+
+    if proba is None or len(proba) == 0:
+        return [], list(getattr(model, "classes_", [])), []
+
+    probabilities = _normalize_probabilities(proba[0])
+    classes = list(getattr(model, "classes_", []))
+    order = np.argsort(probabilities)[::-1] if probabilities else []
+    top_classes: List[Dict[str, Any]] = []
+    for idx in list(order)[:k]:
+        cls_name = classes[idx] if idx < len(classes) else str(idx)
+        prob_val = probabilities[idx] if idx < len(probabilities) else 0.0
+        top_classes.append({"class": str(cls_name), "probability": float(prob_val)})
+    return probabilities, classes, top_classes
+
+
+def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Ejecuta el pipeline híbrido ISO+ML para severidad y patrones de falla."""
+
+    assets = _load_ml_assets()
+    if assets is None:
         return {
             "status": "unavailable",
-            "message": _ML_MODEL_ERROR or "Modelo no disponible",
+            "message": _ML_ASSETS_ERROR or "Modelos de ML no disponibles",
         }
 
+    sev_model, pat_model, sev_keys, pat_keys = assets
+
     try:
-        df_features = pd.DataFrame([feature_row])
-        df_features = df_features.reindex(columns=ML_FEATURE_COLUMNS)
-        df_features = df_features.fillna(0.0)
-        try:
-            df_features = df_features.astype(float)
-        except Exception:
-            df_features = df_features.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
-        expected_names: List[str] = []
-        if hasattr(model, "feature_names_in_"):
-            try:
-                raw_names = getattr(model, "feature_names_in_")
-                if raw_names is not None:
-                    expected_names = [str(name) for name in list(raw_names) if name is not None]
-            except Exception:
-                expected_names = []
-
-        target_columns = expected_names if expected_names else ML_FEATURE_COLUMNS
-        df_features = df_features.reindex(columns=target_columns).fillna(0.0)
-        features_for_model: Any = df_features
+        row = _series_from_features(feature_row)
     except Exception as exc:
-        return {
-            "status": "error",
-            "message": f"No se pudieron preparar las features para el modelo: {exc}",
-        }
+        return {"status": "error", "message": str(exc)}
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            raw_pred = model.predict(features_for_model)[0]
-        try:
-            pred_value = raw_pred.item()  # type: ignore[attr-defined]
-        except Exception:
-            pred_value = raw_pred
-        probabilities = None
-        if hasattr(model, "predict_proba"):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    proba = model.predict_proba(features_for_model)
-                if proba is not None:
-                    probabilities = _normalize_probabilities(proba[0])
-                    classes = list(getattr(model, "classes_", []))
-                else:
-                    classes = []
-            except Exception:
-                probabilities = None
-                classes = []
-        else:
-            classes = []
-        return {
-            "status": "ok",
-            "label": str(pred_value),
-            "raw_prediction": pred_value,
-            "probabilities": probabilities,
-            "classes": classes,
-        }
-    except Exception as exc:  # pragma: no cover - robustez
-        return {
-            "status": "error",
-            "message": f"Error al ejecutar el modelo: {exc}",
-        }
+        X_sev = _build_feature_matrix(row, sev_keys)
+        X_pat = _build_feature_matrix(row, pat_keys)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+    except Exception as exc:  # pragma: no cover - defensivo
+        return {"status": "error", "message": f"Error preparando las features: {exc}"}
+
+    try:
+        rms_val = float(row.get("RMS_g", row.get("rms_vel_mm_s", 0.0)) or 0.0)
+        if rms_val < 0:
+            raise ValueError("RMS_g negativo detectado.")
+    except Exception as exc:
+        return {"status": "error", "message": f"Dato RMS inválido: {exc}"}
+
+    hybrid = HybridISOModel(sev_model, thresholds=ISO_THRESHOLDS, class_names=getattr(sev_model, "classes_", None))
+
+    try:
+        y_ml, probs_ml, y_iso, y_final, conflict = hybrid.predict(X_sev, rms_val)
+    except Exception as exc:
+        return {"status": "error", "message": f"No fue posible combinar ISO y ML: {exc}"}
+
+    sev_probabilities = _normalize_probabilities(probs_ml)
+    sev_classes = list(getattr(sev_model, "classes_", []))
+
+    severity_payload = {
+        "rms_global_mm_s": rms_val,
+        "iso_thresholds": {"A": ISO_THRESHOLDS[0], "B": ISO_THRESHOLDS[1], "C": ISO_THRESHOLDS[2]},
+        "class_iso": y_iso,
+        "class_ml": y_ml,
+        "class_final": y_final,
+        "conflict_flag": bool(conflict),
+        "probabilities": sev_probabilities,
+        "classes": sev_classes,
+    }
+
+    pattern_probabilities, pattern_classes, top3 = _topk_probabilities(pat_model, X_pat, k=3)
+    try:
+        rationale = weak_label_row(row)
+    except Exception:
+        rationale = ""
+
+    patterns_payload = {
+        "classes": pattern_classes,
+        "probabilities": pattern_probabilities,
+        "top3": top3,
+        "rationale_rule": rationale,
+    }
+
+    return {
+        "status": "ok",
+        "label": str(y_final),
+        "raw_prediction": y_ml,
+        "probabilities": sev_probabilities,
+        "classes": sev_classes,
+        "severity": severity_payload,
+        "patterns": patterns_payload,
+    }
 
 
 def _normalize_probabilities(raw_values: Any) -> List[float]:
@@ -1289,11 +1343,37 @@ def analyze_vibration(
         "energy_high": energy_high_frac,
     }
     ml_result = _run_ml_diagnosis(ml_features)
-    if ml_result.get("status") == "ok" and ml_result.get("label"):
-        findings.append(f"Diagnóstico ML: {ml_result['label']}")
-    elif ml_result.get("status") == "error" and ml_result.get("message"):
+    ml_status = ml_result.get("status")
+    if ml_status == "ok":
+        severity_info = ml_result.get("severity") or {}
+        final_class = severity_info.get("class_final") or ml_result.get("label")
+        ml_class = severity_info.get("class_ml")
+        iso_class = severity_info.get("class_iso")
+        conflict_flag = severity_info.get("conflict_flag")
+        if final_class:
+            detail = f"Diagnóstico ML (híbrido ISO): {final_class}"
+            if ml_class and iso_class:
+                detail += f" (ML={ml_class}, ISO={iso_class})"
+            findings.append(detail)
+        if conflict_flag:
+            findings.append("Se detectó conflicto elevado entre la norma ISO y el modelo ML (≥2 niveles).")
+        patterns_info = ml_result.get("patterns") or {}
+        top3 = patterns_info.get("top3") or []
+        if top3:
+            best_pat = top3[0]
+            try:
+                prob_pct = float(best_pat.get("probability", 0.0)) * 100.0
+            except Exception:
+                prob_pct = 0.0
+            findings.append(
+                f"Patrón predominante según ML: {best_pat.get('class', 'Desconocido')} ({prob_pct:.1f}%)."
+            )
+        rationale = patterns_info.get("rationale_rule")
+        if rationale:
+            findings.append(f"Explicación tipo Charlotte: {rationale}")
+    elif ml_status == "error" and ml_result.get("message"):
         findings.append(f"Diagnóstico ML no disponible: {ml_result['message']}")
-    elif ml_result.get("status") == "unavailable" and ml_result.get("message"):
+    elif ml_status == "unavailable" and ml_result.get("message"):
         findings.append(f"Modelo ML no disponible: {ml_result['message']}")
     if f1 > 0 and dom_freq > 0:
         if (abs(dom_freq - f1) <= max(tol_frac * f1, min_bins * df)) and (r2x < 0.5) and (r3x < 0.4) and (e_low / e_total > 0.5):
@@ -4179,19 +4259,34 @@ class MainApp:
                 ml_r2x = float(ml_features_bundle.get('r2x', features_full.get('r2x', 0.0)))
             except Exception:
                 ml_r2x = float(features_full.get('r2x', 0.0))
+
+            severity_pdf = ml_result_pdf.get('severity') if isinstance(ml_result_pdf, dict) else {}
+            severity_pdf = severity_pdf or {}
+            final_class_pdf = severity_pdf.get('class_final') or ml_result_pdf.get('label')
+            iso_class_pdf = severity_pdf.get('class_iso')
+            ml_class_pdf = severity_pdf.get('class_ml')
+            conflict_pdf = bool(severity_pdf.get('conflict_flag'))
+
             ml_status_value = str(
                 ml_result_pdf.get('status')
                 or (ml_bundle_pdf or {}).get('status')
                 or ''
             ).lower()
-            ml_label_display = str(ml_result_pdf.get('label', '') or "No disponible")
-            if ml_status_value != 'ok':
+            if ml_status_value == 'ok':
+                ml_label_display = str(final_class_pdf or "No disponible")
+                detail_parts: List[str] = []
+                if iso_class_pdf:
+                    detail_parts.append(f"ISO: {iso_class_pdf}")
+                if ml_class_pdf:
+                    detail_parts.append(f"ML: {ml_class_pdf}")
+                context_bits = f"Energía >120 Hz {frac_high_pct:.1f}% y relación 2X {ml_r2x:.2f}X."
+                ml_comment = " | ".join(detail_parts) if detail_parts else "Diagnóstico híbrido ISO+ML."
+                ml_comment = f"{ml_comment} {context_bits}".strip()
+                if conflict_pdf:
+                    ml_comment += " Conflicto elevado entre ambos criterios."
+            else:
                 ml_label_display = "No disponible"
-            ml_comment = (
-                f"Energía >120 Hz {frac_high_pct:.1f}% y relación 2X {ml_r2x:.2f}X sin patrones críticos."
-                if ml_status_value == 'ok'
-                else "Modelo ML no disponible para esta medición."
-            )
+                ml_comment = "Modelo ML no disponible para esta medición."
 
             comparison_rows = [
                 (
@@ -4207,13 +4302,14 @@ class MainApp:
             ]
             comparison_table = _build_diagnostic_comparison(comparison_rows)
             if ml_status_value == 'ok':
+                ml_base = ml_class_pdf or ml_label_display
                 discrepancy_note = (
-                    f"Nota sobre el diagnóstico: Mientras que los niveles de vibración RMS (<b>{primary_rms_mm_pdf:.3f} mm/s</b>) "
-                    f"superan los límites de la norma ISO y ubican la condición como <b>{severity_mm}</b>, el modelo de Machine "
-                    f"Learning se apoya en rasgos como la baja energía en alta frecuencia ({frac_high_pct:.1f}%) y una relación 2X "
-                    f"de {ml_r2x:.2f}, por lo que clasifica el activo como \"{ml_label_display}\". Se recomienda priorizar el "
-                    "criterio de la norma ISO debido al riesgo energético evidente."
+                    f"Nota sobre el diagnóstico: la norma ISO clasifica esta medición como <b>{severity_mm}</b> (RMS <b>{primary_rms_mm_pdf:.3f} mm/s</b>). "
+                    f"El modelo ML identifica la condición como <b>{ml_base}</b> apoyándose en la energía de alta frecuencia ({frac_high_pct:.1f}%) y en una relación 2X de {ml_r2x:.2f}. "
+                    f"El esquema híbrido ISO+ML adopta finalmente la condición <b>{ml_label_display}</b>."
                 )
+                if conflict_pdf:
+                    discrepancy_note += " <b>Existe conflicto elevado entre ISO y ML; valide la condición con inspección adicional.</b>"
             else:
                 discrepancy_note = (
                     "Nota sobre el diagnóstico: El modelo de Machine Learning no emitió una clasificación confiable para esta "
@@ -4254,8 +4350,26 @@ class MainApp:
                 except Exception:
                     accent_hex_value = "#1f77b4"
                 if ml_status_pdf == 'ok':
-                    ml_label = str(ml_result_pdf.get('label', ''))
-                    ml_card_body.append(Paragraph(f"Resultado sugerido: <b>{ml_label}</b>", styles['Normal']))
+                    severity_pdf = ml_result_pdf.get('severity') if isinstance(ml_result_pdf, dict) else {}
+                    severity_pdf = severity_pdf or {}
+                    patterns_pdf = ml_result_pdf.get('patterns') if isinstance(ml_result_pdf, dict) else {}
+                    patterns_pdf = patterns_pdf or {}
+
+                    ml_label = str(severity_pdf.get('class_final') or ml_result_pdf.get('label', '') or 'No disponible')
+                    iso_pdf = severity_pdf.get('class_iso')
+                    ml_inner = severity_pdf.get('class_ml')
+                    conflict_pdf = bool(severity_pdf.get('conflict_flag'))
+
+                    ml_card_body.append(Paragraph(f"Resultado híbrido: <b>{ml_label}</b>", styles['Normal']))
+                    detail_parts = []
+                    if iso_pdf:
+                        detail_parts.append(f"ISO: <b>{iso_pdf}</b>")
+                    if ml_inner:
+                        detail_parts.append(f"ML: <b>{ml_inner}</b>")
+                    if detail_parts:
+                        ml_card_body.append(Paragraph(" | ".join(detail_parts), styles['Muted']))
+                    if conflict_pdf:
+                        ml_card_body.append(Paragraph('<font color="#c0392b"><b>Conflicto elevado entre ISO y ML.</b></font>', styles['Normal']))
                     ml_card_body.append(Spacer(1, 4))
                     ml_card_body.append(Paragraph("Características evaluadas", styles['Muted']))
                     ml_features_pdf = dict(ml_features_bundle)
@@ -4266,8 +4380,8 @@ class MainApp:
                         ("Energía alta", f"{ml_features_pdf.get('energy_high', 0.0) * 100:.1f}%"),
                     ]
                     ml_card_body.append(_pdf_metric_grid(feature_metrics, accent_color))
-                    classes = list(ml_result_pdf.get('classes') or [])
-                    probabilities = list(ml_result_pdf.get('probabilities') or [])
+                    classes = list(severity_pdf.get('classes') or ml_result_pdf.get('classes') or [])
+                    probabilities = list(severity_pdf.get('probabilities') or ml_result_pdf.get('probabilities') or [])
                     if classes and probabilities and len(classes) == len(probabilities):
                         ranked = sorted(zip(classes, probabilities), key=lambda x: x[1], reverse=True)
                         proba_rows: List[List[Any]] = []
@@ -4293,6 +4407,36 @@ class MainApp:
                         ml_card_body.append(Spacer(1, 6))
                         ml_card_body.append(Paragraph("Probabilidades por clase", styles['Muted']))
                         ml_card_body.append(proba_tbl)
+                    pattern_top_pdf = patterns_pdf.get('top3') or []
+                    rationale_pdf = str(patterns_pdf.get('rationale_rule') or '').strip()
+                    if pattern_top_pdf:
+                        pat_rows: List[List[Any]] = []
+                        for entry in pattern_top_pdf:
+                            prob_val = float(entry.get('probability', 0.0))
+                            pat_rows.append([
+                                Paragraph(f"<b>{str(entry.get('class', 'Patrón'))}</b>", styles['Normal']),
+                                ProbabilityBar(prob_val, fill_color=accent_hex_value, back_color="#f5eef8"),
+                                Paragraph(f"{prob_val * 100:.1f}%", styles['Normal']),
+                            ])
+                        pat_tbl = Table(pat_rows, colWidths=[doc.width * 0.32, doc.width * 0.28, doc.width * 0.2])
+                        pat_tbl.setStyle(
+                            TableStyle(
+                                [
+                                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d7d7d7")),
+                                ]
+                            )
+                        )
+                        ml_card_body.append(Spacer(1, 6))
+                        ml_card_body.append(Paragraph("Patrones más probables", styles['Muted']))
+                        ml_card_body.append(pat_tbl)
+                    if rationale_pdf:
+                        ml_card_body.append(Spacer(1, 4))
+                        ml_card_body.append(Paragraph(f"Explicación Charlotte: {rationale_pdf}", styles['Normal']))
                 else:
                     ml_message = ml_result_pdf.get('message') or "No se pudo obtener el diagnóstico automático."
                 if ml_message:
@@ -5102,16 +5246,22 @@ class MainApp:
         )
 
         if status == "ok":
-            label = str(ml_result.get("label", "Diagnóstico"))
-            classes = list(ml_result.get("classes") or [])
-            probabilities = list(ml_result.get("probabilities") or [])
-            probs_view: List[ft.Control] = []
-            if classes and probabilities and len(classes) == len(probabilities):
-                ranked = sorted(zip(classes, probabilities), key=lambda x: x[1], reverse=True)
+            severity_info = ml_result.get("severity") or {}
+            patterns_info = ml_result.get("patterns") or {}
+
+            final_label = str(severity_info.get("class_final") or ml_result.get("label") or "Diagnóstico")
+            iso_label = severity_info.get("class_iso")
+            ml_label = severity_info.get("class_ml")
+            conflict_flag = bool(severity_info.get("conflict_flag"))
+
+            severity_classes = list(ml_result.get("classes") or [])
+            severity_probabilities = list(ml_result.get("probabilities") or [])
+            sev_view: List[ft.Control] = []
+            if severity_classes and severity_probabilities and len(severity_classes) == len(severity_probabilities):
+                ranked = sorted(zip(severity_classes, severity_probabilities), key=lambda x: x[1], reverse=True)
                 for cls, prob in ranked:
                     prob_val = float(prob)
-                    bar = ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent)
-                    probs_view.append(
+                    sev_view.append(
                         ft.Column(
                             [
                                 ft.Row(
@@ -5121,29 +5271,80 @@ class MainApp:
                                     ],
                                     alignment="spaceBetween",
                                 ),
-                                bar,
+                                ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent),
                             ],
                             spacing=4,
                         )
                     )
+
+            highlight_lines: List[ft.Control] = [
+                ft.Text(f"Severidad final: {final_label}", weight="bold", color=accent)
+            ]
+            sub_parts: List[str] = []
+            if iso_label:
+                sub_parts.append(f"ISO: {iso_label}")
+            if ml_label:
+                sub_parts.append(f"ML: {ml_label}")
+            if sub_parts:
+                highlight_lines.append(ft.Text(" | ".join(sub_parts), size=12, color="#34495e"))
+            if conflict_flag:
+                highlight_lines.append(
+                    ft.Text(
+                        "Conflicto elevado entre ISO y ML",
+                        size=12,
+                        color="#c0392b",
+                        weight="bold",
+                    )
+                )
             highlight = ft.Container(
-                content=ft.Text(
-                    f"Resultado sugerido: {label}",
-                    weight="bold",
-                    color=accent,
-                ),
+                content=ft.Column(highlight_lines, spacing=4),
                 bgcolor=ft.Colors.with_opacity(0.15, accent),
                 border_radius=12,
                 padding=ft.padding.symmetric(horizontal=14, vertical=10),
             )
-            body_controls: List[ft.Control] = [highlight, metrics_row]
-            if probs_view:
-                body_controls.append(
-                    ft.Column(
-                        probs_view,
-                        spacing=6,
+
+            pattern_top = patterns_info.get("top3") or []
+            pattern_view: List[ft.Control] = []
+            if pattern_top:
+                for entry in pattern_top:
+                    prob_val = float(entry.get("probability", 0.0))
+                    pattern_view.append(
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Text(str(entry.get("class", "Patrón")), weight="bold", expand=True),
+                                        ft.Text(f"{prob_val * 100:.1f}%", weight="bold"),
+                                    ],
+                                    alignment="spaceBetween",
+                                ),
+                                ft.ProgressBar(value=max(0.0, min(1.0, prob_val)), color=accent),
+                            ],
+                            spacing=4,
+                        )
+                    )
+
+            rationale_text = str(patterns_info.get("rationale_rule") or "").strip()
+            pattern_section_controls: List[ft.Control] = []
+            if pattern_view:
+                pattern_section_controls.append(ft.Text("Patrones probables", weight="bold", size=13))
+                pattern_section_controls.append(ft.Column(pattern_view, spacing=6))
+            if rationale_text:
+                pattern_section_controls.append(
+                    ft.Text(
+                        f"Explicación Charlotte: {rationale_text}",
+                        size=12,
+                        color="#34495e",
                     )
                 )
+
+            body_controls: List[ft.Control] = [highlight, metrics_row]
+            if sev_view:
+                body_controls.append(ft.Text("Probabilidades de severidad", weight="bold", size=13))
+                body_controls.append(ft.Column(sev_view, spacing=6))
+            if pattern_section_controls:
+                body_controls.append(ft.Container(ft.Column(pattern_section_controls, spacing=6), padding=ft.padding.only(top=6)))
+
             return ft.Container(
                 content=ft.Column(
                     [
