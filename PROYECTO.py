@@ -57,6 +57,7 @@ PATH_PAT_MODEL = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/mod
 PATH_PAT_KEYS = r"C:/Users/QTMP0104/Downloads/Proyecto/Proyecto/Proyecto/IA/model_patterns/feature_keys.json"
 
 ISO_THRESHOLDS = (2.8, 4.5, 7.1)  # A, B, C mm/s (ajusta si aplica)
+GRAVITY_M_S2 = 9.80665
 
 _SEVERITY_MODEL: Optional[Any] = None
 _PATTERN_MODEL: Optional[Any] = None
@@ -329,7 +330,9 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
 
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Si tenemos valores negativos asumimos que son logits y aplicamos softmax.
+    if not np.any(arr):
+        return [0.0 for _ in range(arr.size)]
+
     if np.any(arr < 0.0):
         shifted = arr - np.max(arr)
         exp_scores = np.exp(shifted)
@@ -343,50 +346,30 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
         min_val = float(np.min(arr))
 
         if max_val <= 0.0:
-            return [0.0 for _ in arr.tolist()]
+            return [0.0 for _ in range(arr.size)]
 
         if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
             scaled = arr.copy()
         elif max_val <= 100.0 + 1e-6 and min_val >= -1e-6:
             scaled = arr / 100.0
         else:
-            scaled = arr / max_val
+            total = float(np.sum(arr))
+            if total <= 0:
+                scaled = np.full_like(arr, 1.0 / arr.size)
+            else:
+                scaled = arr / total
 
         scaled = np.clip(scaled, 0.0, None)
         total = float(np.sum(scaled))
-        if total > 0:
-            arr = scaled / total
-        else:
+        if total <= 0:
             arr = np.full_like(scaled, 1.0 / scaled.size)
+        else:
+            arr = scaled / total
 
-    if arr.size > 1:
-        # Suavizado de Laplace para evitar distribuciones degeneradas.
-        smooth = max(1e-3, 1.0 / (50.0 * arr.size))
-        arr = arr + smooth
-        arr = arr / np.sum(arr)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            entropy = float(-np.sum(arr * np.log(np.clip(arr, 1e-12, 1.0))))
-        max_entropy = float(np.log(arr.size)) if arr.size else 0.0
-
-        if max_entropy > 0.0 and entropy < max_entropy:
-            concentration = entropy / max_entropy
-
-            # Suavizado por temperatura para redistribuir confianza excesiva.
-            if concentration < 0.9:
-                temperature = 1.0 + (1.0 - concentration) * 2.5
-                log_probs = np.log(np.clip(arr, 1e-12, 1.0)) / temperature
-                log_probs = log_probs - np.max(log_probs)
-                arr = np.exp(log_probs)
-                arr = arr / np.sum(arr)
-
-            # Mezcla adaptativa con la distribución uniforme cuando la entropía es muy baja.
-            if concentration < 0.65:
-                beta = float(np.clip((0.65 - concentration) * 0.9, 0.12, 0.45))
-                uniform = np.full_like(arr, 1.0 / arr.size)
-                arr = (1.0 - beta) * arr + beta * uniform
-                arr = arr / np.sum(arr)
-
+    epsilon = max(1e-3, 1.0 / (250.0 * max(1, arr.size)))
+    arr = np.clip(arr, 0.0, None)
+    arr = arr + epsilon
+    arr = arr / np.sum(arr)
     arr = np.clip(arr, 0.0, 1.0)
     return arr.tolist()
 
@@ -1446,9 +1429,23 @@ def analyze_vibration(
         dom_freq, dom_amp = 0.0, 0.0
     # Severidad basada en RMS de velocidad temporal (mm/s)
     rms_vel_spec_mm = rms_vel_time_mm
+    crest_factor = float(peak_acc / rms_time_acc) if rms_time_acc > 1e-9 else 0.0
+    kurt_excess = 0.0
+    if len(a_proc) >= 4:
+        centered = a_proc - float(np.mean(a_proc))
+        m2 = float(np.mean(centered**2))
+        m4 = float(np.mean(centered**4))
+        if m2 > 1e-12:
+            kurt_excess = float(m4 / (m2**2) - 3.0)
+
     f1 = _get_1x(dom_freq, rpm)
-    r2x = _amp_near(xf, mag_vel_mm, 2.0 * f1 if f1 > 0 else 0.0, df) / (dom_amp + 1e-12)
-    r3x = _amp_near(xf, mag_vel_mm, 3.0 * f1 if f1 > 0 else 0.0, df) / (dom_amp + 1e-12)
+    amp_1x = _amp_near(xf, mag_vel_mm, f1, df) if f1 > 0 else (dom_amp if dom_freq > 0 else 0.0)
+    f2 = 2.0 * f1 if f1 > 0 else 0.0
+    f3 = 3.0 * f1 if f1 > 0 else 0.0
+    amp_2x = _amp_near(xf, mag_vel_mm, f2, df) if f2 > 0 else 0.0
+    amp_3x = _amp_near(xf, mag_vel_mm, f3, df) if f3 > 0 else 0.0
+    r2x = amp_2x / (amp_1x + 1e-12)
+    r3x = amp_3x / (amp_1x + 1e-12)
     if len(xf) > 0:
         e_total = float(np.sum(mag_vel_mm**2)) + 1e-12
         e_low = float(np.sum((mag_vel_mm[(xf >= 0.0) & (xf < 30.0)]**2))) if np.any((xf >= 0) & (xf < 30)) else 0.0
@@ -1460,6 +1457,18 @@ def analyze_vibration(
     energy_mid_frac = float(e_mid / e_total) if e_total > 0 else 0.0
     energy_high_frac = float(e_high / e_total) if e_total > 0 else 0.0
     peaks_fft = _find_top_peaks(xf, mag_vel_mm, k=top_k_peaks, min_freq=0.5, snr_db=min_snr_db)
+
+    if amp_1x > 0.0 and len(xf) and len(mag_vel_mm):
+        base_freq = f1 if f1 > 0 else dom_freq
+        guard = max(tol_frac * max(base_freq, 1.0), max(2, min_bins) * (df if df > 0 else 0.0))
+        mask = (xf >= max(0.5, base_freq * 0.2)) & (np.abs(xf - base_freq) > guard)
+        noise_floor = float(np.median(mag_vel_mm[mask])) if np.any(mask) else 0.0
+        if noise_floor > 0.0:
+            snr_1x_db = float(20.0 * np.log10(np.maximum(amp_1x, 1e-12) / (noise_floor + 1e-12)))
+        else:
+            snr_1x_db = 0.0
+    else:
+        snr_1x_db = 0.0
     # Envolvente: opcionalmente aplicar band-pass previo
     a_env_src = a_proc
     try:
@@ -1484,18 +1493,55 @@ def analyze_vibration(
     sev_label, sev_color = _severity_iso_mm_s(rms_vel_spec_mm)
     findings: List[str] = []
     findings.append(f"Severidad ISO: {sev_label} (RMS={rms_vel_spec_mm:.3f} mm/s)")
+    pct_low = energy_low_frac * 100.0
+    pct_mid = energy_mid_frac * 100.0
+    pct_high = energy_high_frac * 100.0
+    rms_acc_g = rms_time_acc / GRAVITY_M_S2 if GRAVITY_M_S2 else 0.0
+
     ml_features = {
+        # Aceleración
         "rms_acc_ms2": rms_time_acc,
+        "rms_acc_g": rms_acc_g,
+        "RMS_g": rms_acc_g,
         "peak_acc_ms2": peak_acc,
         "pp_acc_ms2": pp_acc,
+        "crest": crest_factor,
+        "crest_factor": crest_factor,
+        "kurt_excess": kurt_excess,
+        "kurtosis": kurt_excess + 3.0,
+        # Velocidad y severidad
         "rms_vel_mm_s": rms_vel_spec_mm,
+        "RMS_vel_mm_s": rms_vel_spec_mm,
+        "RMS_global_mm_s": rms_vel_spec_mm,
+        "rms_global_mm_s": rms_vel_spec_mm,
+        # Dominantes espectrales
         "dom_freq_hz": dom_freq,
         "dom_amp_mm_s": dom_amp,
+        "F1X_hz": f1,
+        "A1X": amp_1x,
+        "F2X_hz": f2,
+        "A2X": amp_2x,
+        "F3X_hz": f3,
+        "A3X": amp_3x,
+        # Relaciones armónicas y métricas de energía
         "r2x": r2x,
         "r3x": r3x,
+        "R_2X_1X": r2x,
+        "R_3X_1X": r3x,
+        "snr_1x_db": snr_1x_db,
+        "SNR_1X_dB": snr_1x_db,
         "energy_low": energy_low_frac,
         "energy_mid": energy_mid_frac,
         "energy_high": energy_high_frac,
+        "E_low": energy_low_frac,
+        "E_mid": energy_mid_frac,
+        "E_hi": energy_high_frac,
+        "PCT_low": pct_low,
+        "PCT_mid": pct_mid,
+        "PCT_hi": pct_high,
+        "pct_low": pct_low,
+        "pct_mid": pct_mid,
+        "pct_hi": pct_high,
     }
     ml_result = _run_ml_diagnosis(ml_features)
     ml_status = ml_result.get("status")
