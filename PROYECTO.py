@@ -79,13 +79,32 @@ def iso20816_class_from_rms(rms_mm_s: float, thresholds: Tuple[float, float, flo
 
 
 class HybridISOModel:
-    def __init__(self, base_model: Any, thresholds: Tuple[float, float, float] = ISO_THRESHOLDS, class_names: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        base_model: Any,
+        thresholds: Tuple[float, float, float] = ISO_THRESHOLDS,
+        class_names: Optional[Sequence[str]] = None,
+    ):
         self.model = base_model
         self.thresholds = thresholds
         default_classes = ["Buena", "Satisfactoria", "Insatisfactoria", "Inaceptable"]
-        if class_names is None:
-            class_names = getattr(base_model, "classes_", default_classes)
-        self.classes_ = list(class_names) if class_names else list(default_classes)
+
+        resolved_classes: Any = class_names
+        if resolved_classes is None:
+            resolved_classes = getattr(base_model, "classes_", default_classes)
+
+        if isinstance(resolved_classes, np.ndarray):
+            resolved_classes = resolved_classes.tolist()
+
+        try:
+            resolved_classes = list(resolved_classes)
+        except TypeError:
+            resolved_classes = list(default_classes)
+
+        if not resolved_classes:
+            resolved_classes = list(default_classes)
+
+        self.classes_ = [str(cls_name) for cls_name in resolved_classes]
 
     def predict(self, X: Any, rms_global_mm_s: float) -> Tuple[str, np.ndarray, str, str, bool]:
         X = np.asarray(X).reshape(1, -1)
