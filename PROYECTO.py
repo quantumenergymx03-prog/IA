@@ -22,9 +22,8 @@ mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
 import unicodedata
-from typing import Optional, Tuple, Dict, Any, List, Sequence
+from typing import Optional, Tuple, Dict, Any, List, Sequence, Mapping
 
-from charlotte_rules import weak_label_row
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -165,14 +164,23 @@ def _series_from_features(feature_row: Dict[str, Any]) -> pd.Series:
         raise ValueError("Las características proporcionadas no son válidas para el modelo.")
 
 
-def _build_feature_matrix(row: pd.Series, keys: List[str]) -> np.ndarray:
+def _build_feature_matrix(row: pd.Series, keys: List[str]) -> Tuple[np.ndarray, List[str]]:
     """Ordena y convierte las características siguiendo la lista de llaves entregada."""
 
-    missing = [k for k in keys if k not in row.index]
+    if not isinstance(row, pd.Series):
+        row = pd.Series(row)
+
+    selected = row.reindex(keys)
+    missing = [key for key, value in selected.items() if pd.isna(value)]
     if missing:
-        raise ValueError(f"Faltan columnas requeridas: {missing}")
-    values = row[keys].astype(float).values.reshape(1, -1)
-    return values
+        selected.loc[missing] = 0.0
+
+    try:
+        values = selected.astype(float).values.reshape(1, -1)
+    except Exception as exc:
+        raise ValueError(f"No se pudieron convertir las columnas a float: {exc}")
+
+    return values, missing
 
 
 def _topk_probabilities(model: Any, X: np.ndarray, k: int = 3) -> Tuple[List[float], List[str], List[Dict[str, Any]]]:
@@ -217,8 +225,8 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
     try:
-        X_sev = _build_feature_matrix(row, sev_keys)
-        X_pat = _build_feature_matrix(row, pat_keys)
+        X_sev, missing_sev = _build_feature_matrix(row, sev_keys)
+        X_pat, missing_pat = _build_feature_matrix(row, pat_keys)
     except ValueError as exc:
         return {"status": "error", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensivo
@@ -241,6 +249,8 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
     sev_probabilities = _normalize_probabilities(probs_ml)
     sev_classes = list(getattr(sev_model, "classes_", []))
 
+    missing_features = sorted(set(missing_sev + missing_pat))
+
     severity_payload = {
         "rms_global_mm_s": rms_val,
         "iso_thresholds": {"A": ISO_THRESHOLDS[0], "B": ISO_THRESHOLDS[1], "C": ISO_THRESHOLDS[2]},
@@ -250,6 +260,7 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         "conflict_flag": bool(conflict),
         "probabilities": sev_probabilities,
         "classes": sev_classes,
+        "missing_features": missing_features,
     }
 
     pattern_probabilities, pattern_classes, top3 = _topk_probabilities(pat_model, X_pat, k=3)
@@ -263,6 +274,7 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         "probabilities": pattern_probabilities,
         "top3": top3,
         "rationale_rule": rationale,
+        "missing_features": missing_features,
     }
 
     return {
@@ -273,6 +285,7 @@ def _run_ml_diagnosis(feature_row: Dict[str, Any]) -> Dict[str, Any]:
         "classes": sev_classes,
         "severity": severity_payload,
         "patterns": patterns_payload,
+        "missing_features": missing_features,
     }
 
 
@@ -309,6 +322,81 @@ def _normalize_probabilities(raw_values: Any) -> List[float]:
         return _clip_range(scaled)
 
     return _clip_range(values)
+
+
+def _charlotte_to_mapping(row: Any) -> Mapping[str, Any]:
+    """Convierte la fila recibida a un mapeo para las reglas de Charlotte."""
+
+    if isinstance(row, Mapping):
+        return row
+    if hasattr(row, "to_dict"):
+        try:
+            return row.to_dict()
+        except Exception:  # pragma: no cover - defensivo
+            pass
+    if hasattr(row, "items"):
+        return dict(row)
+    raise ValueError("No se pudo interpretar la fila de características para reglas Charlotte")
+
+
+def _charlotte_safe_float(data: Mapping[str, Any], key: str, fallback_keys: Tuple[str, ...] = ()) -> float:
+    """Obtiene un valor numérico de forma robusta para reglas Charlotte."""
+
+    keys = (key,) + tuple(fallback_keys)
+    for candidate in keys:
+        try:
+            value = data.get(candidate)  # type: ignore[arg-type]
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def weak_label_row(row: Any) -> str:
+    """Devuelve una explicación textual basada en reglas simples estilo Charlotte."""
+
+    data = _charlotte_to_mapping(row)
+
+    pct_low = _charlotte_safe_float(data, "PCT_low", ("energy_low",))
+    pct_mid = _charlotte_safe_float(data, "PCT_mid", ("energy_mid",))
+    pct_high = _charlotte_safe_float(data, "PCT_hi", ("energy_high",))
+    r2x = _charlotte_safe_float(data, "R_2X_1X", ("r2x",))
+    r3x = _charlotte_safe_float(data, "R_3X_1X", ("r3x",))
+    crest = _charlotte_safe_float(data, "crest")
+    kurtosis = _charlotte_safe_float(data, "kurt_excess")
+    snr_1x = _charlotte_safe_float(data, "SNR_1X_dB", ("snr_1x_db",))
+    rms = _charlotte_safe_float(data, "RMS_g", ("rms_vel_mm_s",))
+
+    rationale_parts: List[str] = []
+
+    if pct_low > 0.55 and r2x < 0.5 and r3x < 0.4:
+        rationale_parts.append(
+            "Energía concentrada en baja frecuencia con armónicos contenidos: indicio de desbalance"
+        )
+    if r2x >= 0.6 or r3x >= 0.45:
+        rationale_parts.append(
+            "Armónicos 2X/3X elevados respecto a 1X, compatibles con desalineación"
+        )
+    if pct_high >= 0.35 or crest >= 5.0 or kurtosis >= 4.0:
+        rationale_parts.append(
+            "Alta energía en alta frecuencia y factores estadísticos grandes: posible defecto en rodamientos"
+        )
+    if snr_1x >= 12.0 and pct_mid >= 0.25:
+        rationale_parts.append(
+            "Dominancia pronunciada de 1X con energía media: verificar solturas o resonancias"
+        )
+    if not rationale_parts and rms >= 7.0:
+        rationale_parts.append("Nivel RMS elevado: condición severa según norma ISO")
+
+    if not rationale_parts:
+        return "Sin reglas Charlotte activas para esta muestra."
+
+    return " | ".join(rationale_parts)
 
 # Conjunto de fallas consideradas en la Tabla de Charlotte para motores eléctricos.
 # Cada entrada incluye un identificador, el nombre de la falla y una descripción breve
